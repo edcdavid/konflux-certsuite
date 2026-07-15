@@ -9,7 +9,9 @@ spec:
   description: |
     Provisions an ephemeral EaaS Hypershift cluster, deploys an operator from
     an FBC fragment, deploys operands from a test bundle, and runs certsuite.
-    The cluster is automatically destroyed when the PipelineRun completes.
+    On failure, debug-cluster prints the kubeconfig and holds the PipelineRun
+    (and thus the EaaS cluster) for 60 minutes for live debugging. The cluster
+    is destroyed when the PipelineRun completes or is cancelled.
 
     This is the recommended variant for most operators. Use the shared-cluster
     variant (certsuite-operator-test.yaml) only when you need a persistent
@@ -39,11 +41,19 @@ spec:
     - name: CHANNEL_NAME
       type: string
       default: ""
-    # NOTE: CREDENTIALS_SECRET_NAME, OCI_REF, CERT_TRACK_* params are not
-    # included here because Konflux IntegrationTestScenarios do not provide
-    # pipeline-level workspace bindings needed by the collect-results task.
-    # Results collection should be added as a step inside deploy-and-test
-    # when needed.
+    - name: CREDENTIALS_SECRET_NAME
+      type: string
+      default: ""
+      description: |
+        Tenant-namespace Secret with OCI registry credentials
+        (key oci-storage-dockerconfigjson or .dockerconfigjson).
+        When empty, OCI push is skipped.
+    - name: OCI_REF
+      type: string
+      default: ""
+      description: |
+        OCI artifact reference for results (oras push). When empty, OCI
+        push is skipped.
 
   tasks:
     # ── 1. Parse Snapshot Metadata ──────────────────────────────────────
@@ -118,6 +128,7 @@ spec:
                 value: $(params.CHANNEL_NAME)
 
     # ── 4. Pick Cluster Params ─────────────────────────────────────────
+    # Prefer test-bundle spec.ocpVersion when set; else FBC-derived version.
     - name: pick-cluster-params
       runAfter:
         - get-unreleased-bundle
@@ -125,12 +136,32 @@ spec:
         - input: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
           operator: notin
           values: [""]
+      params:
+        - name: testBundleRef
+          value: $(params.TEST_BUNDLE_REF)
+        - name: fbcFragment
+          value: "$(tasks.parse-metadata.results.component-container-image)"
+        - name: eaasSpaceSecretRef
+          value: "$(tasks.provision-eaas-space.results.secretRef)"
       taskSpec:
+        params:
+          - name: testBundleRef
+            type: string
+          - name: fbcFragment
+            type: string
+          - name: eaasSpaceSecretRef
+            type: string
+        # Emit task results the classic way (/tekton/results/...). Mapping
+        # value: $(steps.*.results.*) from inline script steps has been
+        # unreliable on this cluster (ocpVersion never appeared downstream).
         results:
           - name: ocpVersion
-            value: "$(steps.pick-cluster-version.results.ocpVersion)"
+            description: OCP minor version prefix for EaaS provisioning
           - name: bundleArch
-            value: "$(steps.pick-cluster-arch.results.bundleArch)"
+            description: Bundle architecture for cluster provisioning
+        volumes:
+          - name: ocp-pick
+            emptyDir: {}
         steps:
           - name: get-supported-versions
             ref:
@@ -144,7 +175,7 @@ spec:
                   value: stepactions/eaas-get-supported-ephemeral-cluster-versions/0.1/eaas-get-supported-ephemeral-cluster-versions.yaml
             params:
               - name: eaasSpaceSecretRef
-                value: "$(tasks.provision-eaas-space.results.secretRef)"
+                value: "$(params.eaasSpaceSecretRef)"
           - name: pick-cluster-version
             ref:
               resolver: git
@@ -157,9 +188,90 @@ spec:
                   value: stepactions/bundles/pick-cluster-version/0.1/pick-cluster-version.yaml
             params:
               - name: fbcFragment
-                value: "$(tasks.parse-metadata.results.component-container-image)"
+                value: "$(params.fbcFragment)"
               - name: clusterVersions
                 value: ["$(steps.get-supported-versions.results.versions[*])"]
+          # Array results expand in args, not env. Persist on the volume.
+          - name: flatten-supported-versions
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            volumeMounts:
+              - name: ocp-pick
+                mountPath: /ocp-pick
+            args:
+              - "$(steps.get-supported-versions.results.versions[*])"
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              echo -n "$*" > /ocp-pick/supported-versions
+              echo "[$(date -u +%FT%T.%3NZ)] Supported EaaS versions: $(cat /ocp-pick/supported-versions)"
+          - name: resolve-ocp-version
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            volumeMounts:
+              - name: ocp-pick
+                mountPath: /ocp-pick
+            env:
+              - name: TEST_BUNDLE_REF
+                value: "$(params.testBundleRef)"
+              - name: FBC_OCP_VERSION
+                value: "$(steps.pick-cluster-version.results.ocpVersion)"
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              # Prefer certsuite-test-bundle.yaml spec.ocpVersion when set.
+              TB_OCP=""
+              if [[ -n "${TEST_BUNDLE_REF}" ]]; then
+                GIT_URL_AND_REV="${TEST_BUNDLE_REF%%#*}"
+                BUNDLE_PATH="${TEST_BUNDLE_REF#*#}"
+                [[ "${BUNDLE_PATH}" == "${TEST_BUNDLE_REF}" ]] && BUNDLE_PATH="."
+                if [[ "${GIT_URL_AND_REV}" == *".git@"* ]]; then
+                  GIT_URL="${GIT_URL_AND_REV%.git@*}.git"
+                  GIT_REV="${GIT_URL_AND_REV##*.git@}"
+                else
+                  GIT_URL="${GIT_URL_AND_REV}"
+                  GIT_REV=""
+                fi
+                BRANCH_ARGS=""
+                [[ -n "${GIT_REV}" ]] && BRANCH_ARGS="-b ${GIT_REV}"
+                CLONE_DIR=$(mktemp -d)
+                echo "[$(date -u +%FT%T.%3NZ)] Reading ocpVersion from test bundle ${GIT_URL} path=${BUNDLE_PATH}"
+                git clone --depth 1 ${BRANCH_ARGS} "${GIT_URL}" "${CLONE_DIR}"
+                TB_MANIFEST="${CLONE_DIR}/${BUNDLE_PATH}/certsuite-test-bundle.yaml"
+                if [[ -f "${TB_MANIFEST}" ]]; then
+                  TB_OCP=$(grep -E '^[[:space:]]*ocpVersion:' "${TB_MANIFEST}" | head -1 | awk '{print $2}' | tr -d '"' || true)
+                fi
+                rm -rf "${CLONE_DIR}"
+              fi
+              TB_OCP="${TB_OCP#v}"
+
+              SUPPORTED=""
+              [[ -f /ocp-pick/supported-versions ]] && SUPPORTED=$(cat /ocp-pick/supported-versions)
+              echo "[$(date -u +%FT%T.%3NZ)] Supported EaaS versions: ${SUPPORTED}"
+              echo "[$(date -u +%FT%T.%3NZ)] FBC-picked version: ${FBC_OCP_VERSION:-none}"
+              echo "[$(date -u +%FT%T.%3NZ)] Test-bundle ocpVersion: ${TB_OCP:-unset}"
+
+              pick=""
+              if [[ -n "${TB_OCP}" ]]; then
+                if printf '%s\n' ${SUPPORTED} | grep -Fxq "${TB_OCP}"; then
+                  pick="${TB_OCP}"
+                  echo "[$(date -u +%FT%T.%3NZ)] Using test-bundle ocpVersion=${pick}"
+                else
+                  echo "ERROR: test-bundle spec.ocpVersion=${TB_OCP} is not in EaaS supported versions: ${SUPPORTED}" >&2
+                  echo "Update the test bundle or wait until EaaS offers that minor." >&2
+                  exit 1
+                fi
+              else
+                pick="${FBC_OCP_VERSION:-}"
+                echo "[$(date -u +%FT%T.%3NZ)] No test-bundle ocpVersion; using FBC-picked=${pick:-none}"
+              fi
+
+              if [[ -z "${pick}" ]]; then
+                echo "ERROR: no OCP version selected" >&2
+                exit 1
+              fi
+
+              echo -n "${pick}" > /ocp-pick/ocp-version
+              echo "[$(date -u +%FT%T.%3NZ)] Selected ocpVersion=${pick}"
           - name: pick-cluster-arch
             ref:
               resolver: git
@@ -172,7 +284,23 @@ spec:
                   value: stepactions/bundles/pick-cluster-arch/0.1/pick-cluster-arch.yaml
             params:
               - name: bundleImage
-                value: "$(tasks.parse-metadata.results.component-container-image)"
+                value: "$(params.fbcFragment)"
+          - name: emit-results
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            volumeMounts:
+              - name: ocp-pick
+                mountPath: /ocp-pick
+            env:
+              - name: BUNDLE_ARCH
+                value: "$(steps.pick-cluster-arch.results.bundleArch)"
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              OCP=$(cat /ocp-pick/ocp-version)
+              ARCH="${BUNDLE_ARCH:-amd64}"
+              echo "[$(date -u +%FT%T.%3NZ)] Emitting task results ocpVersion=${OCP} bundleArch=${ARCH}"
+              echo -n "${OCP}" > "$(results.ocpVersion.path)"
+              echo -n "${ARCH}" > "$(results.bundleArch.path)"
 
     # ── 5. Provision Ephemeral Cluster ─────────────────────────────────
     - name: provision-cluster
@@ -249,6 +377,12 @@ spec:
           value: $(params.TEST_BUNDLE_REF)
         - name: certsuiteLabels
           value: $(params.CERTSUITE_LABELS)
+        - name: snapshot
+          value: $(params.SNAPSHOT)
+        - name: ociRef
+          value: $(params.OCI_REF)
+        - name: credentialsSecretName
+          value: $(params.CREDENTIALS_SECRET_NAME)
       taskSpec:
         params:
           - name: eaasSpaceSecretRef
@@ -267,6 +401,15 @@ spec:
             type: string
           - name: certsuiteLabels
             type: string
+          - name: snapshot
+            type: string
+            default: ""
+          - name: ociRef
+            type: string
+            default: ""
+          - name: credentialsSecretName
+            type: string
+            default: ""
         volumes:
           - name: credentials
             emptyDir: {}
@@ -291,9 +434,11 @@ spec:
                 value: credentials
 
           # ── Step 2: Deploy operator via OLM ──────────────────────────
+          # onError: continue so debug-cluster still runs (and holds the EaaS
+          # cluster) after a deploy failure. TaskRun remains Failed.
           - name: deploy-operator
-            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             onError: continue
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             computeResources:
               limits:
                 memory: 4Gi
@@ -314,12 +459,84 @@ spec:
                 value: "$(params.packageName)"
               - name: CHANNEL_NAME
                 value: "$(params.channelName)"
+              - name: SNAPSHOT
+                value: "$(params.snapshot)"
+              - name: TEST_BUNDLE_REF
+                value: "$(params.testBundleRef)"
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+              # EXIT (not only ERR): explicit `exit 1` does not fire ERR.
+              trap 'ec=$?; [[ $ec -ne 0 ]] && touch /credentials/step-failed' EXIT
 
               echo "[$(date -u +%FT%T.%3NZ)] Deploying operator: package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
               oc whoami || { echo "ERROR: Cannot connect to cluster"; exit 1; }
+
+              echo ""
+              echo "════════════════════════════════════════════════════"
+              echo " kubeconfig (also re-printed in debug-cluster on failure)"
+              echo "════════════════════════════════════════════════════"
+              echo "KUBECONFIG=${KUBECONFIG}"
+              cat "${KUBECONFIG}"
+              echo ""
+              PASS_FILE=$(ls /credentials/*-password 2>/dev/null | head -1 || true)
+              if [[ -n "${PASS_FILE}" && -f "${PASS_FILE}" ]]; then
+                echo "── admin password ──"
+                cat "${PASS_FILE}"
+                echo ""
+                echo "oc login $(oc whoami --show-server 2>/dev/null) -u kubeadmin -p $(cat "${PASS_FILE}") --insecure-skip-tls-verify"
+                echo ""
+              fi
+
+              # ── Fetch test bundle metadata (installMode, namespace) ─────────
+              TEST_BUNDLE_DIR=$(mktemp -d)
+              GIT_URL_AND_REV="${TEST_BUNDLE_REF%%#*}"
+              BUNDLE_PATH="${TEST_BUNDLE_REF#*#}"
+              [[ "${BUNDLE_PATH}" == "${TEST_BUNDLE_REF}" ]] && BUNDLE_PATH="."
+              if [[ "${GIT_URL_AND_REV}" == *".git@"* ]]; then
+                GIT_URL="${GIT_URL_AND_REV%.git@*}.git"
+                GIT_REV="${GIT_URL_AND_REV##*.git@}"
+              else
+                GIT_URL="${GIT_URL_AND_REV}"
+                GIT_REV=""
+              fi
+              BRANCH_ARGS=""
+              [[ -n "${GIT_REV}" ]] && BRANCH_ARGS="-b ${GIT_REV}"
+              echo "[$(date -u +%FT%T.%3NZ)] Fetching test bundle ${GIT_URL} (rev: ${GIT_REV:-HEAD}, path: ${BUNDLE_PATH})"
+              CLONE_DIR=$(mktemp -d)
+              git clone --depth 1 ${BRANCH_ARGS} "${GIT_URL}" "${CLONE_DIR}"
+              cp -r "${CLONE_DIR}/${BUNDLE_PATH}/." "${TEST_BUNDLE_DIR}/"
+              rm -rf "${CLONE_DIR}"
+              TB_MANIFEST="${TEST_BUNDLE_DIR}/certsuite-test-bundle.yaml"
+              if [[ ! -f "${TB_MANIFEST}" ]]; then
+                echo "ERROR: certsuite-test-bundle.yaml not found in TEST_BUNDLE_REF" >&2
+                exit 1
+              fi
+              TB_INSTALL_MODE=$(grep -E '^[[:space:]]*installMode:' "${TB_MANIFEST}" | head -1 | awk '{print $2}' | tr -d '"' || true)
+              TB_NAMESPACE=$(TB_MANIFEST="${TB_MANIFEST}" python3 - <<'PY'
+              import os, re
+              text = open(os.environ["TB_MANIFEST"]).read().splitlines()
+              in_spec = False
+              for line in text:
+                  if re.match(r"^spec:\s*$", line):
+                      in_spec = True
+                      continue
+                  if in_spec and re.match(r"^[A-Za-z]", line):
+                      break
+                  if in_spec:
+                      m = re.match(r"^\s*namespace:\s*(.*)$", line)
+                      if m:
+                          val = m.group(1).strip().strip('"').strip("'")
+                          if val and not val.startswith("#"):
+                              print(val)
+                              break
+              PY
+              )
+              echo "[$(date -u +%FT%T.%3NZ)] Test bundle installMode=${TB_INSTALL_MODE:-unset} namespace=${TB_NAMESPACE:-unset}"
+              if [[ -z "${TB_INSTALL_MODE}" ]]; then
+                echo "ERROR: spec.installMode is required in certsuite-test-bundle.yaml (OwnNamespace|SingleNamespace|MultiNamespace|AllNamespaces)" >&2
+                exit 1
+              fi
 
               # ── Wait for at least one worker node to be Ready ──────────────
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for worker nodes..."
@@ -333,140 +550,528 @@ spec:
                 sleep 5
               done
 
-              # ── Render FBC and resolve bundle image ────────────────────────
-              echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC fragment..."
-              opm render "${FBC_FRAGMENT}" > /tmp/fbc.json
+              # ── CRI-O registry mirrors (auto-generated, digest-only) ─────────
+              NS_MIRRORS="${REGISTRY_MIRRORS_NAMESPACE:-certsuite-registry-mirrors}"
+              CONF_NAME="99-certsuite-konflux-mirrors.conf"
 
-              BUNDLE_NAME=$(jq -r 'select(.schema == "olm.bundle") | .name' /tmp/fbc.json | head -1)
-              echo "[$(date -u +%FT%T.%3NZ)] Bundle name: ${BUNDLE_NAME}"
+              echo "[$(date -u +%FT%T.%3NZ)] Generating registry mirror mappings..."
+              MAPPINGS_JSON=$(python3 - \
+                "${FBC_FRAGMENT:-}" \
+                "${BUNDLE_IMAGE:-}" \
+                "${PACKAGE_NAME:-}" \
+                "${SNAPSHOT:-}" <<'PY'
+              import json, os, re, subprocess, sys, urllib.request, base64
 
-              ORIG_BUNDLE_IMG=$(jq -r 'select(.schema == "olm.bundle") | .image' /tmp/fbc.json | head -1)
-              echo "[$(date -u +%FT%T.%3NZ)] Original bundle image: ${ORIG_BUNDLE_IMG}"
+              fbc, bundle_image, package_name, snapshot_raw = sys.argv[1:5]
 
-              FBC_BASE="${FBC_FRAGMENT%%@*}"
-              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
-              TENANT="${TENANT_AND_REPO%%/*}"
-              FBC_REPO="${TENANT_AND_REPO#*/}"
-              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
-              BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
-              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
 
-              echo "[$(date -u +%FT%T.%3NZ)] Trying: ${QUAY_BUNDLE}"
-              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
-                BUNDLE_REPO2=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
-                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO2}@${BUNDLE_DIGEST}"
-                echo "[$(date -u +%FT%T.%3NZ)] Trying: ${QUAY_BUNDLE}"
-                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
-                  { echo "ERROR: Cannot resolve bundle at quay.io"; exit 1; }
+              def eprint(*a):
+                  print(*a, file=sys.stderr)
+
+
+              def repo_and_digest(pullspec: str):
+                  if "@" in pullspec:
+                      repo, dig = pullspec.rsplit("@", 1)
+                      if dig.startswith("sha256:"):
+                          return repo, dig
+                  return pullspec, ""
+
+
+              def extract_tenant(fbc_ref: str) -> str:
+                  base = fbc_ref.split("@", 1)[0]
+                  prefix = "quay.io/redhat-user-workloads/"
+                  if not base.startswith(prefix):
+                      return ""
+                  rest = base[len(prefix) :]
+                  return rest.split("/", 1)[0]
+
+
+              def opm_render(ref: str) -> str:
+                  # Keep stderr out of the parsed payload — opm logs on stderr and mixing
+                  # them corrupts JSON/NDJSON (deploy uses bash stdout-only capture).
+                  try:
+                      proc = subprocess.run(
+                          ["opm", "render", ref],
+                          text=True,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          check=False,
+                      )
+                  except FileNotFoundError:
+                      eprint("ERROR: opm binary not found in PATH")
+                      sys.exit(1)
+                  if proc.stderr:
+                      eprint(proc.stderr.rstrip())
+                  if proc.returncode != 0:
+                      eprint(f"ERROR: opm render failed for {ref} (exit {proc.returncode})")
+                      if proc.stdout:
+                          eprint(proc.stdout[:2000])
+                      sys.exit(1)
+                  return proc.stdout
+
+
+              def iter_fbc_objects(fbc_out: str):
+                  """Yield dict objects from opm render output.
+
+                  opm often emits pretty-printed concatenated JSON objects (not a JSON
+                  array and not single-line NDJSON). Use raw_decode to walk the stream.
+                  """
+                  raw = (fbc_out or "").strip()
+                  if not raw:
+                      return
+                  decoder = json.JSONDecoder()
+                  idx = 0
+                  n = len(raw)
+                  while idx < n:
+                      while idx < n and raw[idx].isspace():
+                          idx += 1
+                      if idx >= n:
+                          break
+                      try:
+                          obj, end = decoder.raw_decode(raw, idx)
+                      except json.JSONDecodeError as exc:
+                          eprint(f"WARN: failed to decode FBC JSON at offset {idx}: {exc}")
+                          eprint(f"  snippet: {raw[idx:idx+120]!r}")
+                          break
+                      idx = end
+                      if isinstance(obj, list):
+                          for item in obj:
+                              if isinstance(item, dict):
+                                  yield item
+                      elif isinstance(obj, dict):
+                          yield obj
+
+
+              def select_bundle(fbc_out: str, bundle_image: str, package_name: str):
+                  digest = ""
+                  if "@" in bundle_image:
+                      dig = bundle_image.rsplit("@", 1)[-1]
+                      if dig.startswith("sha256:"):
+                          digest = dig
+                  matched = []
+                  fallback = []
+                  for obj in iter_fbc_objects(fbc_out):
+                      if obj.get("schema") != "olm.bundle":
+                          continue
+                      img = str(obj.get("image") or "")
+                      if (digest and img.endswith(digest)) or (bundle_image and img == bundle_image):
+                          matched.append(obj)
+                      elif not package_name or obj.get("package") == package_name:
+                          fallback.append(obj)
+                  return matched or fallback
+
+
+              def collect_rhio_images(bundles: list) -> list:
+                  """Return list of (repo, digest) for registry.redhat.io images."""
+                  seen = {}
+                  for b in bundles:
+                      candidates = []
+                      img = b.get("image") or ""
+                      if img:
+                          candidates.append(img)
+                      for ri in b.get("relatedImages") or []:
+                          if isinstance(ri, dict) and ri.get("image"):
+                              candidates.append(ri["image"])
+                          elif isinstance(ri, str):
+                              candidates.append(ri)
+                      for prop in b.get("properties") or []:
+                          if prop.get("type") != "olm.bundle.object":
+                              continue
+                          data = (prop.get("value") or {}).get("data")
+                          if not data:
+                              continue
+                          try:
+                              obj = json.loads(base64.b64decode(data))
+                          except Exception:
+                              continue
+                          if obj.get("kind") != "ClusterServiceVersion":
+                              continue
+                          for ri in obj.get("spec", {}).get("relatedImages") or []:
+                              if isinstance(ri, dict) and ri.get("image"):
+                                  candidates.append(ri["image"])
+                          for dep in (
+                              obj.get("spec", {})
+                              .get("install", {})
+                              .get("spec", {})
+                              .get("deployments")
+                              or []
+                          ):
+                              containers = (
+                                  dep.get("spec", {})
+                                  .get("template", {})
+                                  .get("spec", {})
+                                  .get("containers")
+                                  or []
+                              )
+                              containers += (
+                                  dep.get("spec", {})
+                                  .get("template", {})
+                                  .get("spec", {})
+                                  .get("initContainers")
+                                  or []
+                              )
+                              for c in containers:
+                                  if c.get("image"):
+                                      candidates.append(c["image"])
+                              for env in sum((c.get("env") or [] for c in containers), []):
+                                  val = env.get("value") or ""
+                                  if "registry.redhat.io/" in val and "@sha256:" in val:
+                                      candidates.append(val)
+
+                      for pull in candidates:
+                          if not isinstance(pull, str):
+                              continue
+                          if not (
+                              pull.startswith("registry.redhat.io/")
+                              or pull.startswith("registry.stage.redhat.io/")
+                          ):
+                              continue
+                          repo, dig = repo_and_digest(pull)
+                          if not dig:
+                              continue
+                          seen.setdefault(repo, dig)
+                  return [(r, d) for r, d in seen.items()]
+
+
+              def snapshot_digest_index(snapshot_raw: str) -> dict:
+                  idx = {}
+                  if not (snapshot_raw or "").strip():
+                      return idx
+                  try:
+                      snap = json.loads(snapshot_raw)
+                  except json.JSONDecodeError:
+                      eprint("WARN: SNAPSHOT is not valid JSON; ignoring for digest index")
+                      return idx
+                  for comp in snap.get("components") or []:
+                      img = comp.get("containerImage") or ""
+                      repo, dig = repo_and_digest(img)
+                      if dig and repo.startswith("quay.io/"):
+                          idx[dig] = repo
+                  return idx
+
+
+              def list_tenant_repos(tenant: str) -> list:
+                  if not tenant:
+                      return []
+                  url = f"https://quay.io/api/v1/find/repositories?query=redhat-user-workloads/{tenant}"
+                  try:
+                      with urllib.request.urlopen(url, timeout=30) as resp:
+                          data = json.load(resp)
+                  except Exception as exc:
+                      eprint(f"WARN: quay find repositories failed: {exc}")
+                      return []
+                  repos = []
+                  for r in data.get("results") or []:
+                      name = r.get("name") or ""
+                      if name.startswith(f"{tenant}/"):
+                          repos.append(name[len(tenant) + 1 :])
+                      elif "/" not in name:
+                          repos.append(name)
+                  return sorted(set(repos))
+
+
+              def skopeo_has(pullspec: str) -> bool:
+                  try:
+                      subprocess.run(
+                          ["skopeo", "inspect", "--raw", f"docker://{pullspec}"],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          check=True,
+                          timeout=60,
+                      )
+                      return True
+                  except Exception:
+                      return False
+
+
+              def resolve_mirror(repo: str, digest: str, idx: dict, tenant: str, tenant_repos: list) -> str:
+                  if digest in idx:
+                      return idx[digest]
+                  if "kube-rbac-proxy" in repo:
+                      return "quay.io/openshift/origin-kube-rbac-proxy"
+                  if tenant:
+                      for r in tenant_repos:
+                          candidate = f"quay.io/redhat-user-workloads/{tenant}/{r}@{digest}"
+                          if skopeo_has(candidate):
+                              return f"quay.io/redhat-user-workloads/{tenant}/{r}"
+                  return ""
+
+
+              eprint(f"Auto-generating registry mirrors from FBC={fbc}")
+              eprint(f"  bundle_image={bundle_image or '(none)'} package={package_name or '(none)'}")
+              fbc_out = opm_render(fbc)
+              objs = list(iter_fbc_objects(fbc_out))
+              schemas = {}
+              for o in objs:
+                  schemas[o.get("schema") or "(none)"] = schemas.get(o.get("schema") or "(none)", 0) + 1
+              eprint(f"  FBC objects={len(objs)} schemas={schemas}")
+
+              bundles = select_bundle(fbc_out, bundle_image, package_name)
+              if not bundles:
+                  eprint("ERROR: no olm.bundle found in FBC (cannot generate registry mirrors)")
+                  eprint(f"  first 500 chars of opm stdout: {fbc_out[:500]!r}")
+                  sys.exit(1)
+
+              eprint(
+                  "  selected bundle(s): "
+                  + ", ".join(f"{b.get('name')} image={b.get('image')}" for b in bundles)
+              )
+
+              rhio = collect_rhio_images(bundles)
+              if not rhio:
+                  eprint("No registry.redhat.io relatedImages found; no mirrors needed")
+                  print("[]")
+                  sys.exit(0)
+
+              idx = snapshot_digest_index(snapshot_raw)
+              eprint(f"Snapshot digest index entries: {len(idx)}; RHIO images: {len(rhio)}")
+              tenant = extract_tenant(fbc)
+              tenant_repos = list_tenant_repos(tenant) if tenant else []
+              if tenant:
+                  eprint(f"Quay tenant={tenant} repos={len(tenant_repos)}")
+
+              mappings = []
+              misses = []
+              for repo, dig in rhio:
+                  mirror = resolve_mirror(repo, dig, idx, tenant, tenant_repos)
+                  if mirror:
+                      eprint(f"  {repo}@{dig} → {mirror}")
+                      mappings.append({"source": repo, "mirror": mirror})
+                  else:
+                      eprint(f"  {repo}@{dig} → UNRESOLVED")
+                      misses.append(f"{repo}@{dig}")
+
+              if misses:
+                  eprint(
+                      "ERROR: could not resolve quay mirror for: "
+                      + ", ".join(misses)
+                      + " (OLM would hang pulling registry.redhat.io digests)"
+                  )
+                  sys.exit(1)
+
+              uniq = {}
+              for m in mappings:
+                  uniq[m["source"]] = m["mirror"]
+              out = [{"source": s, "mirror": m} for s, m in sorted(uniq.items())]
+              print(json.dumps(out, separators=(",", ":")))
+              PY
+              )
+
+              if [[ -n "${MAPPINGS_JSON}" && "${MAPPINGS_JSON}" != "[]" ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] Applying registry mirrors DaemonSet..."
+                echo "[$(date -u +%FT%T.%3NZ)] Mappings: ${MAPPINGS_JSON}"
+                TMPDIR=$(mktemp -d)
+                MAPPINGS_JSON="${MAPPINGS_JSON}" python3 - <<'PY' > "${TMPDIR}/${CONF_NAME}"
+              import json, os
+              data = json.loads(os.environ["MAPPINGS_JSON"])
+              lines = ["# Generated by konflux-certsuite (digest-only)"]
+              for entry in data:
+                  source, mirror = entry["source"], entry["mirror"]
+                  lines.extend([
+                      "",
+                      "[[registry]]",
+                      '  prefix = ""',
+                      f'  location = "{source}"',
+                      "  [[registry.mirror]]",
+                      f'    location = "{mirror}"',
+                      '    pull-from-mirror = "digest-only"',
+                  ])
+              print("\n".join(lines) + "\n")
+              PY
+                oc create namespace "${NS_MIRRORS}" --dry-run=client -o yaml | oc apply -f -
+                oc apply -f - <<EOF
+              apiVersion: v1
+              kind: ServiceAccount
+              metadata:
+                name: registry-mirror
+                namespace: ${NS_MIRRORS}
+              ---
+              apiVersion: rbac.authorization.k8s.io/v1
+              kind: ClusterRoleBinding
+              metadata:
+                name: ${NS_MIRRORS}-privileged
+              roleRef:
+                apiGroup: rbac.authorization.k8s.io
+                kind: ClusterRole
+                name: system:openshift:scc:privileged
+              subjects:
+                - kind: ServiceAccount
+                  name: registry-mirror
+                  namespace: ${NS_MIRRORS}
+              EOF
+                oc create configmap registry-mirrors -n "${NS_MIRRORS}" \
+                  --from-file="${CONF_NAME}=${TMPDIR}/${CONF_NAME}" \
+                  --dry-run=client -o yaml | oc apply -f -
+                oc apply -f - <<EOF
+              apiVersion: apps/v1
+              kind: DaemonSet
+              metadata:
+                name: registry-mirrors
+                namespace: ${NS_MIRRORS}
+                labels:
+                  app.kubernetes.io/name: ${NS_MIRRORS}
+              spec:
+                selector:
+                  matchLabels:
+                    app.kubernetes.io/name: ${NS_MIRRORS}
+                template:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/name: ${NS_MIRRORS}
+                  spec:
+                    serviceAccountName: registry-mirror
+                    hostPID: true
+                    priorityClassName: system-node-critical
+                    tolerations:
+                      - operator: Exists
+                    containers:
+                      - name: apply-mirrors
+                        image: registry.access.redhat.com/ubi9/ubi:latest
+                        imagePullPolicy: IfNotPresent
+                        securityContext:
+                          privileged: true
+                          runAsUser: 0
+                        command:
+                          - /bin/bash
+                          - -ec
+                          - |
+                            set -euo pipefail
+                            DEST=/host-registries.d/${CONF_NAME}
+                            SRC=/config/${CONF_NAME}
+                            apply_and_reload() {
+                              cp "\${SRC}" "\${DEST}"
+                              chmod 0644 "\${DEST}"
+                              echo "Wrote \${DEST}"
+                              if nsenter --target 1 --mount --uts --ipc --net --pid -- systemctl reload crio; then
+                                echo "Reloaded crio"
+                              else
+                                nsenter --target 1 --mount --uts --ipc --net --pid -- systemctl restart crio
+                              fi
+                            }
+                            apply_and_reload
+                            while true; do
+                              sleep 60
+                              if ! cmp -s "\${SRC}" "\${DEST}" 2>/dev/null; then
+                                apply_and_reload
+                              fi
+                            done
+                        volumeMounts:
+                          - name: config
+                            mountPath: /config
+                            readOnly: true
+                          - name: host-registries-d
+                            mountPath: /host-registries.d
+                    volumes:
+                      - name: config
+                        configMap:
+                          name: registry-mirrors
+                      - name: host-registries-d
+                        hostPath:
+                          path: /etc/containers/registries.conf.d
+                          type: Directory
+              EOF
+                oc -n "${NS_MIRRORS}" rollout status daemonset/registry-mirrors --timeout=180s
+                rm -rf "${TMPDIR}"
+                echo "[$(date -u +%FT%T.%3NZ)] Registry mirrors ready"
+              else
+                echo "[$(date -u +%FT%T.%3NZ)] No registry mirror mappings; skipping DaemonSet"
               fi
-              echo "[$(date -u +%FT%T.%3NZ)] Resolved bundle: ${QUAY_BUNDLE}"
 
-              # Replace the bundle image in FBC (use actual image from FBC, not param)
-              sed "s|${ORIG_BUNDLE_IMG}|${QUAY_BUNDLE}|g" /tmp/fbc.json > /tmp/fbc-patched.json
+              # ── Plain OLM: CatalogSource (image) + Subscription ────────────
+              # Render FBC (quay). BUNDLE_IMAGE is often registry.redhat.io
+              # (production mapping) and cannot be opm-rendered from the task pod.
+              echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC fragment for bundle metadata..."
+              if ! fbc_render_out=$(opm render "${FBC_FRAGMENT}"); then
+                echo "ERROR: Failed to render FBC fragment" >&2
+                exit 1
+              fi
 
-              # ── Determine install namespace from FBC metadata ──────────────
-              INSTALL_NAMESPACE=$(jq -r 'select(.schema == "olm.bundle") | .properties[]? |
-                select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' \
-                /tmp/fbc.json 2>/dev/null | grep -v '^$' | head -1)
+              BUNDLE_DIGEST="${BUNDLE_IMAGE#*@}"
+              [[ "${BUNDLE_DIGEST}" == "${BUNDLE_IMAGE}" ]] && BUNDLE_DIGEST=""
 
+              bundle_render_out=$(echo "${fbc_render_out}" | jq -c \
+                --arg dig "${BUNDLE_DIGEST}" --arg img "${BUNDLE_IMAGE}" '
+                select(.schema == "olm.bundle") |
+                select(
+                  ($dig != "" and (.image | tostring | endswith($dig))) or
+                  (.image == $img)
+                )')
+              if [[ -z "${bundle_render_out}" ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] No FBC bundle matched ${BUNDLE_IMAGE}; falling back to package=${PACKAGE_NAME}"
+                bundle_render_out=$(echo "${fbc_render_out}" | jq -c --arg pkg "${PACKAGE_NAME}" '
+                  select(.schema == "olm.bundle") |
+                  select($pkg == "" or .package == $pkg)')
+              fi
+              if [[ -z "${bundle_render_out}" ]]; then
+                echo "ERROR: No olm.bundle entry found in FBC fragment" >&2
+                exit 1
+              fi
+              echo "[$(date -u +%FT%T.%3NZ)] Using bundle: $(echo "${bundle_render_out}" | jq -r 'select(.schema == "olm.bundle") | .name' | head -1)"
+
+              # Namespace: test bundle wins, else CSV suggested-namespace, else generated.
+              INSTALL_NAMESPACE="${TB_NAMESPACE:-}"
+              if [[ -z "${INSTALL_NAMESPACE}" ]]; then
+                INSTALL_NAMESPACE=$(echo "${bundle_render_out}" | jq -r '
+                  select(.schema == "olm.bundle") | .properties[]? |
+                  select(.type == "olm.csv.metadata") |
+                  .value.annotations["operatorframework.io/suggested-namespace"] // empty' 2>/dev/null | head -1)
+              fi
               if [[ -z "${INSTALL_NAMESPACE}" || "${INSTALL_NAMESPACE}" == "null" ]]; then
-                INSTALL_NAMESPACE=$(oc create -f - -o jsonpath='{.metadata.name}' <<NS_EOF
+                INSTALL_NAMESPACE=$(oc create -f - -o jsonpath='{.metadata.name}' <<NS
               apiVersion: v1
               kind: Namespace
               metadata:
                 generateName: oo-
-              NS_EOF
+              NS
                 )
               elif ! oc get namespace "${INSTALL_NAMESPACE}" &>/dev/null; then
-                oc create namespace "${INSTALL_NAMESPACE}"
+                # Prefer test-bundle prerequisites/namespace.yaml (operator-specific
+                # labels, e.g. privileged PSA) when present.
+                if [[ -f "${TEST_BUNDLE_DIR}/prerequisites/namespace.yaml" ]]; then
+                  oc apply -f "${TEST_BUNDLE_DIR}/prerequisites/namespace.yaml"
+                else
+                  oc create namespace "${INSTALL_NAMESPACE}"
+                fi
+              elif [[ -f "${TEST_BUNDLE_DIR}/prerequisites/namespace.yaml" ]]; then
+                oc apply -f "${TEST_BUNDLE_DIR}/prerequisites/namespace.yaml" || true
               fi
-
               echo "[$(date -u +%FT%T.%3NZ)] Namespace: ${INSTALL_NAMESPACE}"
               echo -n "${INSTALL_NAMESPACE}" > /workspace/install-namespace
 
-              # ── OperatorGroup (OwnNamespace) ───────────────────────────────
+              # OperatorGroup from test-bundle installMode (not CSV supported-modes list).
+              case "${TB_INSTALL_MODE}" in
+                AllNamespaces)
+                  OG_SPEC=""
+                  ;;
+                OwnNamespace|SingleNamespace|MultiNamespace)
+                  OG_SPEC="targetNamespaces: [\"${INSTALL_NAMESPACE}\"]"
+                  ;;
+                *)
+                  echo "ERROR: unsupported spec.installMode=${TB_INSTALL_MODE}" >&2
+                  echo "Expected: OwnNamespace|SingleNamespace|MultiNamespace|AllNamespaces" >&2
+                  exit 1
+                  ;;
+              esac
+
               EXISTING_OG=$(oc -n "${INSTALL_NAMESPACE}" get operatorgroup -o jsonpath="{.items[*].metadata.name}" 2>/dev/null || true)
               if [[ -z "${EXISTING_OG}" ]]; then
-                oc create -f - <<OG_EOF
+                OG_OP=create
+                OG_META="generateName: oo-"
+              else
+                OG_OP=apply
+                OG_META="name: ${EXISTING_OG}"
+              fi
+              oc ${OG_OP} -f - >/dev/null <<OG_EOF
               apiVersion: operators.coreos.com/v1
               kind: OperatorGroup
               metadata:
-                generateName: oo-
+                ${OG_META}
                 namespace: ${INSTALL_NAMESPACE}
               spec:
-                targetNamespaces:
-                  - ${INSTALL_NAMESPACE}
+                ${OG_SPEC}
               OG_EOF
-              fi
+              echo "[$(date -u +%FT%T.%3NZ)] OperatorGroup created (installMode=${TB_INSTALL_MODE}, spec: ${OG_SPEC:-AllNamespaces})"
 
-              # ── Deploy patched FBC catalog server (subPath mount) ──────────
-              echo "[$(date -u +%FT%T.%3NZ)] Creating patched FBC catalog..."
-              oc create configmap patched-fbc-catalog \
-                --from-file=catalog.json=/tmp/fbc-patched.json \
-                -n "${INSTALL_NAMESPACE}"
-
-              oc apply -f - <<CATALOG_SERVER_EOF
-              apiVersion: apps/v1
-              kind: Deployment
-              metadata:
-                name: patched-fbc-server
-                namespace: ${INSTALL_NAMESPACE}
-              spec:
-                replicas: 1
-                selector:
-                  matchLabels:
-                    app: patched-fbc-server
-                template:
-                  metadata:
-                    labels:
-                      app: patched-fbc-server
-                  spec:
-                    containers:
-                      - name: opm
-                        image: ${FBC_FRAGMENT}
-                        command: ["/bin/opm", "serve", "/catalog"]
-                        ports:
-                          - containerPort: 50051
-                            name: grpc
-                        volumeMounts:
-                          - name: catalog
-                            mountPath: /catalog/catalog.json
-                            subPath: catalog.json
-                        readinessProbe:
-                          exec:
-                            command: ["/bin/grpc_health_probe", "-addr=:50051"]
-                          initialDelaySeconds: 5
-                          periodSeconds: 10
-                    volumes:
-                      - name: catalog
-                        configMap:
-                          name: patched-fbc-catalog
-              ---
-              apiVersion: v1
-              kind: Service
-              metadata:
-                name: patched-fbc-server
-                namespace: ${INSTALL_NAMESPACE}
-              spec:
-                selector:
-                  app: patched-fbc-server
-                ports:
-                  - port: 50051
-                    targetPort: 50051
-                    protocol: TCP
-              CATALOG_SERVER_EOF
-
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for catalog server..."
-              if ! oc rollout status deployment/patched-fbc-server -n "${INSTALL_NAMESPACE}" --timeout=300s; then
-                echo "ERROR: catalog server rollout failed" >&2
-                oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server -o wide 2>&1 || true
-                POD=$(oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server \
-                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-                [[ -n "${POD}" ]] && oc logs "${POD}" -n "${INSTALL_NAMESPACE}" --tail=20 2>&1 || true
-                exit 1
-              fi
-
-              # ── CatalogSource ──────────────────────────────────────────────
               CATSRC=$(oc create -f - -o jsonpath='{.metadata.name}' <<CS_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: CatalogSource
@@ -475,11 +1080,12 @@ spec:
                 namespace: ${INSTALL_NAMESPACE}
               spec:
                 sourceType: grpc
-                address: "patched-fbc-server.${INSTALL_NAMESPACE}.svc:50051"
+                image: ${FBC_FRAGMENT}
                 displayName: "Certsuite Test Catalog"
                 publisher: "konflux-certsuite"
               CS_EOF
               )
+              echo "[$(date -u +%FT%T.%3NZ)] CatalogSource: ${CATSRC}"
 
               for i in $(seq 1 60); do
                 STATE=$(oc get catalogsource "${CATSRC}" -n "${INSTALL_NAMESPACE}" \
@@ -488,9 +1094,8 @@ spec:
                 [[ ${i} -eq 60 ]] && { echo "ERROR: CatalogSource not ready"; exit 1; }
                 sleep 10
               done
-              echo "[$(date -u +%FT%T.%3NZ)] CatalogSource ${CATSRC} READY"
 
-              # ── Subscription (Manual — approve InstallPlan explicitly) ──────
+              BUNDLE_NAME=$(echo "${bundle_render_out}" | jq -r 'select(.schema == "olm.bundle") | .name' | head -1)
               SUB=$(oc create -f - -o jsonpath='{.metadata.name}' <<SUB_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: Subscription
@@ -499,131 +1104,124 @@ spec:
                 namespace: ${INSTALL_NAMESPACE}
               spec:
                 channel: ${CHANNEL_NAME}
-                installPlanApproval: Manual
+                installPlanApproval: Automatic
                 name: ${PACKAGE_NAME}
                 source: ${CATSRC}
                 sourceNamespace: ${INSTALL_NAMESPACE}
                 startingCSV: ${BUNDLE_NAME}
               SUB_EOF
               )
+              echo "[$(date -u +%FT%T.%3NZ)] Subscription: ${SUB}"
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for CSV phase=Succeeded (up to 15m)..."
 
-              # Wait for InstallPlan, then approve it
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for InstallPlan..."
-              IP=""
-              for i in $(seq 1 60); do
+              # installedCSV is often empty until Succeeded; prefer currentCSV / live CSV.
+              resolve_csv() {
+                local csv
+                csv=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
+                  -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
+                [[ -z "${csv}" ]] && csv=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
+                  -o jsonpath='{.status.currentCSV}' 2>/dev/null || echo "")
+                [[ -z "${csv}" ]] && csv=$(oc get csv -n "${INSTALL_NAMESPACE}" \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+                echo "${csv}"
+              }
+
+              # Optional operator-specific CSV JSON Patch from the test bundle
+              # (RFC 6902 via oc patch --type=json). Example: drop master
+              # nodeSelector for HyperShift guests.
+              apply_test_bundle_csv_patch() {
+                local csv="$1"
+                local patch="${TEST_BUNDLE_DIR}/patches/csv.json"
+                [[ -f "${patch}" ]] || return 0
+                echo "[$(date -u +%FT%T.%3NZ)] Applying test-bundle CSV patch ${patch}"
+                oc patch csv "${csv}" -n "${INSTALL_NAMESPACE}" --type=json --patch-file="${patch}"
+              }
+
+              CSV=""
+              PHASE=""
+              CSV_PATCHED=0
+              for i in $(seq 1 90); do
                 IP=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || echo "")
-                [[ -n "${IP}" ]] && break
-                sleep 5
-              done
-              if [[ -z "${IP}" ]]; then
-                echo "ERROR: No InstallPlan created" >&2
-                oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
-                exit 1
-              fi
-              echo "[$(date -u +%FT%T.%3NZ)] Approving InstallPlan ${IP}..."
-              oc patch installplan "${IP}" -n "${INSTALL_NAMESPACE}" \
-                --type merge -p '{"spec":{"approved":true}}' 2>&1
-
-              # Wait for OLM to create CSV
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for OLM to create CSV..."
-              CSV=""
-              for i in $(seq 1 60); do
-                CSV=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
+                INSTALLEDCSV=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
-                [[ -n "${CSV}" ]] && break
-                sleep 5
-              done
-              if [[ -z "${CSV}" ]]; then
-                echo "ERROR: OLM did not create CSV" >&2
-                oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
-                exit 1
-              fi
-              echo "[$(date -u +%FT%T.%3NZ)] CSV created: ${CSV}"
-
-              # ── Dynamically resolve registry.redhat.io images to quay.io ───
-              echo "[$(date -u +%FT%T.%3NZ)] Resolving operator images to quay.io..."
-              CSV_JSON=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o json)
-
-              RH_IMAGES=$(echo "${CSV_JSON}" | grep -oE 'registry\.redhat\.io/[^"\\]+@sha256:[a-f0-9]+' | sort -u || true)
-              echo "  Found $(echo "${RH_IMAGES}" | grep -c . || echo 0) registry.redhat.io image(s)"
-
-              TENANT_REPOS=$(curl -s "https://quay.io/api/v1/find/repositories?query=redhat-user-workloads/${TENANT}" 2>/dev/null \
-                | jq -r '.results[]?.name' 2>/dev/null \
-                | sed "s|^${TENANT}/||" || true)
-
-              for RH_IMG in ${RH_IMAGES}; do
-                IMG_DIGEST="${RH_IMG##*@}"
-                FOUND=""
-                for REPO in ${TENANT_REPOS}; do
-                  QUAY_REF="quay.io/redhat-user-workloads/${TENANT}/${REPO}@${IMG_DIGEST}"
-                  if skopeo inspect --raw "docker://${QUAY_REF}" &>/dev/null; then
-                    echo "  ${RH_IMG} → ${QUAY_REF}"
-                    CSV_JSON=$(echo "${CSV_JSON}" | sed "s|${RH_IMG}|${QUAY_REF}|g")
-                    FOUND=1
+                CURRENTCSV=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
+                  -o jsonpath='{.status.currentCSV}' 2>/dev/null || echo "")
+                CSV=$(resolve_csv)
+                PHASE=""
+                MSG=""
+                IP_PHASE=""
+                IP_APPROVED=""
+                if [[ -n "${IP}" ]]; then
+                  IP_PHASE=$(oc get installplan "${IP}" -n "${INSTALL_NAMESPACE}" \
+                    -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                  IP_APPROVED=$(oc get installplan "${IP}" -n "${INSTALL_NAMESPACE}" \
+                    -o jsonpath='{.spec.approved}' 2>/dev/null || echo "")
+                fi
+                if [[ -n "${CSV}" ]]; then
+                  PHASE=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
+                    -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                  MSG=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
+                    -o jsonpath='{.status.message}' 2>/dev/null || echo "")
+                  if [[ "${CSV_PATCHED}" -eq 0 ]]; then
+                    apply_test_bundle_csv_patch "${CSV}" || true
+                    CSV_PATCHED=1
+                  fi
+                  if [[ "${PHASE}" == "Succeeded" ]]; then
+                    echo "[$(date -u +%FT%T.%3NZ)] CSV '${CSV}' ready"
                     break
                   fi
-                done
-                if [[ -z "${FOUND}" ]]; then
-                  if echo "${RH_IMG}" | grep -q 'kube-rbac-proxy'; then
-                    FALLBACK="quay.io/brancz/kube-rbac-proxy:v0.18.1"
-                    echo "  ${RH_IMG} → ${FALLBACK} (upstream fallback)"
-                    CSV_JSON=$(echo "${CSV_JSON}" | sed "s|${RH_IMG}|${FALLBACK}|g")
-                  else
-                    echo "  ${RH_IMG} → kept (not on quay.io)"
+                  if [[ "${PHASE}" == "Failed" ]]; then
+                    echo "ERROR: CSV failed: ${MSG}" >&2
+                    oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
+                    oc get installplan -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+                    oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+                    oc get events -n "${INSTALL_NAMESPACE}" --sort-by=.lastTimestamp >&2 || true
+                    exit 1
                   fi
                 fi
-              done
-
-              # Remove minKubeVersion and master nodeSelector
-              CSV_JSON=$(echo "${CSV_JSON}" | jq 'del(.spec.minKubeVersion)')
-              CSV_JSON=$(echo "${CSV_JSON}" | jq '
-                (.spec.install.spec.deployments[]?.spec.template.spec.nodeSelector) |=
-                (if . then del(.["node-role.kubernetes.io/master"]) else . end)')
-
-              echo "[$(date -u +%FT%T.%3NZ)] Applying patched CSV..."
-              echo "${CSV_JSON}" | oc replace -f - 2>&1
-
-              # ── Wait for CSV Succeeded ─────────────────────────────────────
-              echo "[$(date -u +%FT%T.%3NZ)] Waiting for CSV phase=Succeeded..."
-              for i in $(seq 1 120); do
-                PHASE=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
-                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-                [[ "${PHASE}" == "Succeeded" ]] && break
-                if [[ "${PHASE}" == "Failed" ]]; then
-                  echo "ERROR: CSV failed" >&2
-                  oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o jsonpath='{.status.message}' >&2
-                  echo "" >&2
-                  oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
-                  exit 1
-                fi
-                if [[ $((i % 6)) -eq 0 ]]; then
-                  echo "[$(date -u +%FT%T.%3NZ)] CSV phase: ${PHASE:-unknown} (${i}/120)"
+                if [[ $((i % 3)) -eq 1 ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] CSV wait ${i}/90 installPlan=${IP:-none} approved=${IP_APPROVED:-?} phase=${IP_PHASE:-?} currentCSV=${CURRENTCSV:-none} installedCSV=${INSTALLEDCSV:-none} csv=${CSV:-none} csvPhase=${PHASE:-none}"
+                  if [[ -n "${MSG}" ]]; then
+                    echo "  message: ${MSG}"
+                  fi
                   oc get pods -n "${INSTALL_NAMESPACE}" --no-headers 2>/dev/null || true
+                  oc get csv -n "${INSTALL_NAMESPACE}" --no-headers 2>/dev/null || true
+                  oc get crd 2>/dev/null | head -20 || true
                 fi
-                sleep 5
+                sleep 10
               done
-
-              if [[ "${PHASE}" != "Succeeded" ]]; then
-                echo "ERROR: Timed out waiting for CSV Succeeded (phase=${PHASE})" >&2
-                oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o json 2>/dev/null \
-                  | jq '{phase: .status.phase, message: .status.message}' >&2 || true
+              if [[ -z "${CSV}" ]] || [[ "$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")" != "Succeeded" ]]; then
+                echo "ERROR: Timed out waiting for CSV" >&2
+                oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
+                echo "=== InstallPlans (summary) ===" >&2
+                oc get installplan -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+                oc get installplan -n "${INSTALL_NAMESPACE}" -o json 2>/dev/null | jq '
+                  .items[] | {
+                    name: .metadata.name,
+                    approved: .spec.approved,
+                    phase: .status.phase,
+                    conditions: [.status.conditions[]? | {type,reason,message}],
+                    bundleLookups: [.status.bundleLookups[]? | {path, conditions}]
+                  }' >&2 || true
+                CSV=$(resolve_csv)
+                [[ -n "${CSV}" ]] && oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o yaml >&2 || true
+                oc get crd 2>/dev/null | head -20 >&2 || true
+                oc get configmap -n "${INSTALL_NAMESPACE}" -o name >&2 || true
                 oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
+                oc describe pods -n "${INSTALL_NAMESPACE}" >&2 || true
+                oc get events -n "${INSTALL_NAMESPACE}" --sort-by=.lastTimestamp >&2 || true
                 exit 1
               fi
-              echo "[$(date -u +%FT%T.%3NZ)] Operator installed successfully"
 
               # ── Certsuite discovery labels ───────────────────────────────────
-              # Patch Subscription status so certsuite can discover the operator
               oc patch subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                 --type merge --subresource status \
-                -p "{\"status\":{\"installedCSV\":\"${CSV}\"}}" 2>&1
+                -p "{\"status\":{\"installedCSV\":\"${CSV}\"}}" 2>&1 || true
 
-              # Label CSV for certsuite operator discovery
               oc label csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
                 "redhat-best-practices-for-k8s.com/operator=target" --overwrite 2>&1
 
-              # Label DaemonSet pods for certsuite pod discovery
               DS_NAMES=$(oc get daemonsets -n "${INSTALL_NAMESPACE}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
               for DS in ${DS_NAMES}; do
                 echo "[$(date -u +%FT%T.%3NZ)] Patching DaemonSet ${DS} with certsuite labels..."
@@ -632,10 +1230,12 @@ spec:
                 oc rollout status daemonset/"${DS}" -n "${INSTALL_NAMESPACE}" --timeout=120s 2>&1 || true
               done
 
+              echo "[$(date -u +%FT%T.%3NZ)] Operator installed successfully"
+
           # ── Step 3: Deploy operands from test bundle ─────────────────
           - name: deploy-operands
-            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             onError: continue
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             volumeMounts:
               - name: credentials
                 mountPath: /credentials
@@ -647,6 +1247,12 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+              trap 'ec=$?; [[ $ec -ne 0 ]] && touch /credentials/step-failed' EXIT
+
+              if [[ -f /credentials/step-failed ]]; then
+                echo "Skipping deploy-operands — a previous step failed (see debug-cluster)."
+                exit 1
+              fi
 
               INSTALL_NAMESPACE=""
               [[ -f /workspace/install-namespace ]] && INSTALL_NAMESPACE=$(cat /workspace/install-namespace)
@@ -713,8 +1319,8 @@ spec:
 
           # ── Step 4: Run certsuite ────────────────────────────────────
           - name: run-certsuite
-            image: quay.io/redhat-best-practices-for-k8s/certsuite:latest
             onError: continue
+            image: quay.io/redhat-best-practices-for-k8s/certsuite:latest
             computeResources:
               limits:
                 memory: 4Gi
@@ -732,6 +1338,12 @@ spec:
             script: |
               #!/usr/bin/env bash
               set -euo pipefail
+              trap 'ec=$?; [[ $ec -ne 0 ]] && touch /credentials/step-failed' EXIT
+
+              if [[ -f /credentials/step-failed ]]; then
+                echo "Skipping run-certsuite — a previous step failed (see debug-cluster)."
+                exit 1
+              fi
 
               # Disable in-cluster config so client-go uses the EaaS kubeconfig
               # instead of the Tekton pod's SA token (Issue #5)
@@ -798,10 +1410,79 @@ spec:
                 echo "[$(date -u +%FT%T.%3NZ)] ${SUITE}: total=${TOTAL} passed=${PASSED} failed=${FAILED}"
               done
 
-          # ── Step 5: Debug — print kubeconfig and hold cluster alive ──
+          # ── Step 5: Push results to OCI (optional) ───────────────────
+          # Runs in the Konflux tenant cluster (in-cluster SA) so it can
+          # read CREDENTIALS_SECRET_NAME. Uses /workspace/results from
+          # run-certsuite. Skips when OCI_REF / secret unset or no results.
+          - name: push-to-oci
+            onError: continue
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
+            env:
+              - name: OCI_REF
+                value: "$(params.ociRef)"
+              - name: CREDENTIALS_SECRET_NAME
+                value: "$(params.credentialsSecretName)"
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              if [[ -z "${OCI_REF}" || -z "${CREDENTIALS_SECRET_NAME}" ]]; then
+                echo "[$(date -u +%FT%T.%3NZ)] OCI_REF or CREDENTIALS_SECRET_NAME not set. Skipping OCI push."
+                exit 0
+              fi
+
+              RESULTS_DIR="/workspace/results"
+              if [[ ! -d "${RESULTS_DIR}" ]] || ! ls "${RESULTS_DIR}"/*/claim.json &>/dev/null; then
+                echo "[$(date -u +%FT%T.%3NZ)] No claim.json under ${RESULTS_DIR}. Skipping OCI push."
+                exit 0
+              fi
+
+              # Read the tenant secret via the Tekton pod SA (not the EaaS guest).
+              unset KUBECONFIG
+              echo "[$(date -u +%FT%T.%3NZ)] Pushing results to OCI: ${OCI_REF}"
+
+              mkdir -p /home/tool-box/.docker
+              OCI_AUTH=$(kubectl get secret "${CREDENTIALS_SECRET_NAME}" \
+                -o jsonpath='{.data.oci-storage-dockerconfigjson}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+              if [[ -z "${OCI_AUTH}" ]]; then
+                OCI_AUTH=$(kubectl get secret "${CREDENTIALS_SECRET_NAME}" \
+                  -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+              fi
+
+              if [[ -z "${OCI_AUTH}" ]]; then
+                echo "ERROR: Could not read OCI credentials from secret ${CREDENTIALS_SECRET_NAME}" >&2
+                exit 1
+              fi
+
+              # konflux-test image has no oras; fetch a pinned release binary.
+              ORAS_VERSION="1.2.2"
+              case "$(uname -m)" in
+                x86_64|amd64) ORAS_ARCH=amd64 ;;
+                aarch64|arm64) ORAS_ARCH=arm64 ;;
+                *) echo "ERROR: unsupported arch $(uname -m) for oras" >&2; exit 1 ;;
+              esac
+              echo "[$(date -u +%FT%T.%3NZ)] Installing oras v${ORAS_VERSION} (${ORAS_ARCH})"
+              curl -fsSL -o /tmp/oras.tgz \
+                "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ORAS_ARCH}.tar.gz"
+              tar -xzf /tmp/oras.tgz -C /tmp oras
+              chmod +x /tmp/oras
+
+              export DOCKER_CONFIG=/tmp/docker-config
+              mkdir -p "${DOCKER_CONFIG}"
+              echo "${OCI_AUTH}" > "${DOCKER_CONFIG}/config.json"
+              # oras ≥1.2 rejects absolute file paths unless --disable-path-validation
+              WORKDIR=$(mktemp -d)
+              tar czf "${WORKDIR}/results.tar.gz" -C /workspace results/
+              (
+                cd "${WORKDIR}"
+                /tmp/oras push "${OCI_REF}" ./results.tar.gz:application/gzip
+              )
+              echo "[$(date -u +%FT%T.%3NZ)] OCI push complete"
+
+          # ── Step 6: Debug — print kubeconfig; hold 1h on failure ─────
+          # Preceding steps use onError: continue so this always runs.
           - name: debug-cluster
             image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
-            onError: continue
             volumeMounts:
               - name: credentials
                 mountPath: /credentials
@@ -810,23 +1491,29 @@ spec:
                 value: "/credentials/$(steps.get-kubeconfig.results.kubeconfig)"
             script: |
               #!/usr/bin/env bash
+              set -uo pipefail
+
               echo "════════════════════════════════════════════════════"
               echo " DEBUG: Cluster connection info"
               echo "════════════════════════════════════════════════════"
               echo ""
-              echo "API Server: $(oc whoami --show-server 2>/dev/null)"
-              echo "User: $(oc whoami 2>/dev/null)"
+              echo "API Server: $(oc whoami --show-server 2>/dev/null || echo unknown)"
+              echo "User: $(oc whoami 2>/dev/null || echo unknown)"
+              echo "KUBECONFIG=${KUBECONFIG}"
               echo ""
               echo "── kubeconfig ──"
-              cat "${KUBECONFIG}" 2>/dev/null
+              cat "${KUBECONFIG}" 2>/dev/null || echo "(kubeconfig missing)"
               echo ""
               echo "── admin password ──"
-              PASS_FILE=$(ls /credentials/*-password 2>/dev/null | head -1)
-              [[ -f "${PASS_FILE}" ]] && cat "${PASS_FILE}"
-              echo ""
-              echo ""
-              echo "── oc login command ──"
-              echo "oc login $(oc whoami --show-server 2>/dev/null) -u kubeadmin -p $(cat "${PASS_FILE}" 2>/dev/null) --insecure-skip-tls-verify"
+              PASS_FILE=$(ls /credentials/*-password 2>/dev/null | head -1 || true)
+              if [[ -n "${PASS_FILE}" && -f "${PASS_FILE}" ]]; then
+                cat "${PASS_FILE}"
+                echo ""
+                echo "── oc login command ──"
+                echo "oc login $(oc whoami --show-server 2>/dev/null) -u kubeadmin -p $(cat "${PASS_FILE}") --insecure-skip-tls-verify"
+              else
+                echo "(no password file under /credentials)"
+              fi
               echo ""
               echo "── Cluster status ──"
               oc get nodes -o wide 2>/dev/null || true
@@ -836,23 +1523,26 @@ spec:
               [[ -f /workspace/install-namespace ]] && INSTALL_NS=$(cat /workspace/install-namespace)
               if [[ -n "${INSTALL_NS}" ]]; then
                 echo "Namespace: ${INSTALL_NS}"
-                oc get csv -n "${INSTALL_NS}" -o wide 2>/dev/null || true
-                oc get subscription -n "${INSTALL_NS}" -o wide 2>/dev/null || true
-                oc get catalogsource -n "${INSTALL_NS}" -o wide 2>/dev/null || true
+                oc get csv,subscription,installplan,catalogsource,operatorgroup -n "${INSTALL_NS}" -o wide 2>/dev/null || true
                 oc get pods -n "${INSTALL_NS}" -o wide 2>/dev/null || true
+                oc get crd 2>/dev/null | head -20 || true
                 echo ""
                 echo "── Events ──"
-                oc get events -n "${INSTALL_NS}" --sort-by='.lastTimestamp' 2>/dev/null | tail -30 || true
+                oc get events -n "${INSTALL_NS}" --sort-by='.lastTimestamp' 2>/dev/null | tail -40 || true
+              else
+                echo "(install namespace unknown — skip operator status dump)"
               fi
               echo ""
               echo "── Non-running pods (all namespaces) ──"
-              oc get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | head -20 || true
+              oc get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null | head -30 || true
               echo ""
-              echo "Sleeping 60 minutes to keep cluster alive for debugging..."
-              echo "Cancel the PipelineRun when done."
-              sleep 3600
 
-    # Results are printed in the deploy-and-test step's certsuite summary.
-    # TODO: Add collect-results as a step inside deploy-and-test when
-    # cert-track and OCI push are needed (Konflux IntegrationTestScenarios
-    # do not provide pipeline-level workspace bindings).
+              if [[ -f /credentials/step-failed ]]; then
+                echo "════════════════════════════════════════════════════"
+                echo " Previous step failed — holding cluster for 60 minutes"
+                echo " Cancel the PipelineRun when finished debugging."
+                echo "════════════════════════════════════════════════════"
+                sleep 3600
+              else
+                echo "All deploy/certsuite steps succeeded — no debug hold."
+              fi

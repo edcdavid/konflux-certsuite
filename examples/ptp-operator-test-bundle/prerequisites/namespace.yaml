@@ -1,0 +1,15 @@
+# PTP requires privileged PSA + SCC for linuxptp-daemon (hostNetwork, privileged).
+# Match the labels from config/manager/manager.yaml in the operator repo.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-ptp
+  labels:
+    name: openshift-ptp
+    openshift.io/cluster-monitoring: "true"
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+  annotations:
+    workload.openshift.io/allowed: management

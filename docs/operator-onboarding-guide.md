@@ -35,8 +35,20 @@ my-operator-test-bundle/
     deployment.yaml                #   Any additional workloads
     service.yaml                   #   Services, etc.
   prerequisites/                   # Optional: pre-deploy resources
+    namespace.yaml                 #   Namespace labels (e.g. privileged PSA)
     pull-secret.yaml               #   Secrets, ConfigMaps, etc.
+  patches/                         # Optional: operator-specific CSV tweaks
+    csv.json                       #   RFC 6902 JSON Patch (oc patch --type=json)
 ```
+
+`patches/csv.json` is applied once the CSV appears via
+`oc patch csv … --type=json --patch-file=…`. Use it for operator-specific
+install tweaks (not generic certsuite logic). See
+[Why patches/csv.json is needed for ptp-operator](#why-patchescsvjson-is-needed-for-ptp-operator)
+for a concrete HyperShift/EaaS example (`/` in JSON Pointer keys is `~1`).
+
+`spec.ocpVersion` (EaaS) selects the HyperShift guest OCP minor. Prefer setting
+it when the CSV pins a kube version that older EaaS guests cannot satisfy.
 
 ## Step 1: Create the Bundle Manifest
 
@@ -50,8 +62,18 @@ metadata:
   labels:
     app.kubernetes.io/part-of: my-operator
 spec:
-  # Leave empty to use the operator's install namespace
+  # Leave empty to use the operator's suggested install namespace from the CSV
   namespace: ""
+
+  # OLM OperatorGroup mode for this test (required for correct installs).
+  # The CSV lists which modes are *supported*; pick the one certsuite should use.
+  # OwnNamespace | SingleNamespace | MultiNamespace | AllNamespaces
+  installMode: OwnNamespace
+
+  # Optional (EaaS pipeline): OCP minor version to provision, e.g. "4.22".
+  # When set, HyperShift uses this instead of the FBC-derived version.
+  # Must appear in the EaaS supported-versions list or the run fails.
+  # ocpVersion: "4.22"
 
   description: |
     Software-only test deployment of my-operator.
@@ -292,6 +314,27 @@ demonstrates a real-world bundle:
   `free_running: 1`) so no PTP-capable NICs are required
 - The operator reconciles these CRs and creates the linuxptp-daemon
   DaemonSet, which is enough to verify proper deployment
+- **`patches/csv.json`** applies HyperShift-specific CSV tweaks after
+  OLM creates the CSV (see below). Optional `spec.ocpVersion` can pin the
+  guest minor when EaaS offers it; the PTP example omits it today because
+  EaaS tops out at 4.21 while the FBC targets 4.22.
+
+### Why `patches/csv.json` is needed for ptp-operator
+
+EaaS provisions HyperShift **guest** clusters. Those differ from a full
+self-managed OpenShift in ways the production PTP CSV does not assume.
+The test bundle therefore patches the installed CSV (RFC 6902 JSON Patch
+via `oc patch --type=json`) before waiting for `Succeeded`:
+
+| Patch | What it does | Why |
+|-------|----------------|-----|
+| `remove` `/spec/minKubeVersion` | Drops the CSV kube floor (e.g. `1.35.0`) | OLM refuses install when guest kube is lower (`RequirementsNotMet`). EaaS often maxes out below the FBC target (e.g. supported list ends at 4.21 / kube 1.34 while the 4.22 CSV wants 1.35). Prefer fixing this with `spec.ocpVersion` when EaaS offers that minor; the remove is a safety net when it cannot. |
+| `replace` `/spec/install/spec/deployments/0/spec/template/spec/nodeSelector` → `{}` | Clears `node-role.kubernetes.io/master: ""` on the operator Deployment | HyperShift guests typically have **worker** nodes only. A master `nodeSelector` leaves the operator unschedulable. |
+
+These patches belong in the **test bundle**, not in the product CSV:
+they are only for certsuite/EaaS validation. Other operators may need
+different (or no) patches — add `patches/csv.json` only when the stock
+CSV cannot install or schedule on the ephemeral guest.
 
 ## Troubleshooting
 

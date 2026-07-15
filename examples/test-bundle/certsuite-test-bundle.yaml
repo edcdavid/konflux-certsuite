@@ -15,8 +15,18 @@ metadata:
     app.kubernetes.io/part-of: example-operator
 spec:
   # Namespace where operands will be deployed.
-  # Leave empty to use the operator's install namespace.
+  # Leave empty to use the operator's suggested install namespace from the CSV.
   namespace: ""
+
+  # OLM OperatorGroup install mode for this test run.
+  # CSV installModes list what is supported; this selects which mode to use.
+  # One of: OwnNamespace | SingleNamespace | MultiNamespace | AllNamespaces
+  installMode: AllNamespaces
+
+  # Optional: EaaS HyperShift OCP minor version (e.g. "4.22").
+  # When set, the EaaS pipeline provisions that minor instead of the
+  # FBC-derived version. Omit to keep FBC-based selection.
+  # ocpVersion: "4.22"
 
   # Human-readable description
   description: |

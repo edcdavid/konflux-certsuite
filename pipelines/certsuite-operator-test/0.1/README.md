@@ -17,14 +17,16 @@ cluster is automatically destroyed when the PipelineRun completes.
 1. `parse-metadata` -- extract snapshot info
 2. `provision-eaas-space` -- allocate EaaS space
 3. `get-unreleased-bundle` -- get operator bundle from FBC
-4. `pick-cluster-params` -- select OCP version and architecture
+4. `pick-cluster-params` -- select OCP version (test-bundle `spec.ocpVersion` wins when set) and architecture
 5. `provision-cluster` -- create ephemeral Hypershift cluster
-6. `deploy-and-test` -- get kubeconfig, deploy operator + operands, run certsuite
-7. `collect-results` -- optionally push to cert-track-results / OCI
+6. `deploy-and-test` -- get kubeconfig, deploy operator + operands, run certsuite, optionally push results to OCI
 
 ### Minimum Parameters
 
 Only `TEST_BUNDLE_REF` is required. Everything else has defaults.
+
+Optional OCI push (inside `deploy-and-test`): set `OCI_REF` and
+`CREDENTIALS_SECRET_NAME` (tenant Secret with `.dockerconfigjson`).
 
 ## Shared Cluster Variant
 

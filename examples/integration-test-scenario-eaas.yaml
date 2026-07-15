@@ -19,10 +19,14 @@ spec:
   params:
     - name: TEST_BUNDLE_REF
       value: "https://github.com/<REPLACE:org>/<REPLACE:repo>.git#certsuite-test-bundle"
-    # All other params are optional with sensible defaults:
+    # Optional — omit to skip OCI push of claim tarball:
+    # - name: OCI_REF
+    #   value: "quay.io/<REPLACE:org>/certsuite-results:<tag>"
+    # - name: CREDENTIALS_SECRET_NAME
+    #   value: "quay-dockerconfig"  # Secret with .dockerconfigjson
+    # Other optional params:
     # - CERTSUITE_LABELS: empty = run all tests
-    # - CERT_TRACK_URL: empty = skip cert-track upload
-    # - OCI_REF: empty = skip OCI push
+    # Registry mirrors are auto-generated from FBC relatedImages + Snapshot.
   resolverRef:
     resolver: git
     params:

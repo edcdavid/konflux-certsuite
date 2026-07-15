@@ -7,6 +7,9 @@ There are two pipeline variants:
 - **EaaS** (recommended) -- ephemeral cluster per run, no infrastructure to manage
 - **Shared Cluster** -- persistent cluster with locking and OADP cleanup
 
+For a detailed before/after comparison of the EaaS OLM + mirror redesign,
+see [eaas-olm-mirrors-before-after.md](eaas-olm-mirrors-before-after.md).
+
 ## EaaS Pipeline (Recommended)
 
 Each run provisions a fresh Hypershift cluster via Konflux EaaS. No
@@ -19,8 +22,7 @@ flowchart TD
     B --> C[get-unreleased-bundle]
     C --> D[pick-cluster-params]
     D --> E[provision-cluster]
-    E --> F["deploy-and-test\n(deploy operator + operands + run certsuite)"]
-    F --> G[collect-results]
+    E --> F["deploy-and-test\n(mirrors + OLM + operands + certsuite + optional OCI push)"]
 ```
 
 | Stage | What it does |
@@ -29,13 +31,13 @@ flowchart TD
 | `get-unreleased-bundle` | Extracts the operator bundle from the FBC fragment |
 | `pick-cluster-params` | Selects OCP version and architecture from supported list |
 | `provision-cluster` | Creates an ephemeral Hypershift AWS cluster |
-| `deploy-and-test` | Gets kubeconfig, deploys operator via OLM, deploys operands from test bundle, runs certsuite |
-| `collect-results` | Optionally pushes claim.json to cert-track-results and/or OCI |
+| `deploy-and-test` | Gets kubeconfig, auto-generates/applies CRI-O registry mirrors from FBC+Snapshot, deploys operator via plain OLM (CatalogSource image + Subscription), deploys operands, runs certsuite, optionally pushes results tarball to OCI (`OCI_REF` + `CREDENTIALS_SECRET_NAME`) |
 
 ## Shared Cluster Pipeline
 
 Uses a pre-existing cluster accessed via kubeconfig Secret. Includes
 Lease-based queueing and OADP backup/restore for multi-tenant safety.
+(Unchanged by the EaaS OLM/mirrors redesign.)
 
 ```mermaid
 flowchart TD
@@ -136,6 +138,26 @@ ClusterRoles). It does *not* restore etcd or OpenShift platform operators.
 CSV, CatalogSource, OperatorGroup), operator-installed CRDs, and the
 install/operand namespaces. OADP restore then handles any remaining drift.
 
+## Registry mirrors (EaaS, auto-generated)
+
+When Konflux quay images are not pullable as `registry.redhat.io@sha256:...`
+on HyperShift guests (where IDMS/ITMS/ICP often cannot remap digests), the
+**EaaS** pipeline auto-generates digest-only CRI-O mirrors inside
+`deploy-and-test` before plain OLM deploy:
+
+1. `opm render` the FBC and collect `registry.redhat.io` images from the
+   matched `olm.bundle` (`relatedImages`, CSV, bundle `.image`).
+2. Resolve each digest to a quay repo via the full Snapshot
+   `components[].containerImage` index when present.
+3. Fall back to quay tenant repository lookup (tenant derived from the FBC
+   pullspec) plus a public fallback for `kube-rbac-proxy`.
+4. Apply a privileged DaemonSet in `certsuite-registry-mirrors` that writes
+   `/etc/containers/registries.conf.d` and reloads CRI-O.
+
+No ITS parameter is required. If no RHIO relatedImages are found, the
+DaemonSet is skipped. EaaS guests are destroyed after the run, so mirror
+cleanup is unnecessary. The shared-cluster pipeline does not use this path.
+
 ## Operator Test Bundle
 
 The test bundle is a directory (hosted in a git repo or OCI image) that
@@ -146,14 +168,26 @@ managed separately via the `CERTSUITE_CONFIG_SECRET` pipeline parameter.
 
 ```
 my-operator-test-bundle/
-  certsuite-test-bundle.yaml    # Bundle metadata (namespace, readiness, etc.)
-  prerequisites/                # (optional) Secrets, ConfigMaps needed first
+  certsuite-test-bundle.yaml    # Bundle metadata (namespace, installMode, readiness)
+  prerequisites/                # (optional) Secrets, ConfigMaps, namespace labels
     secret.yaml
+  patches/                      # (optional) operator-specific CSV JSON Patch
+    csv.json                    #   oc patch --type=json --patch-file=…
   operands/                     # Kubernetes manifests for operand instances
     my-custom-resource.yaml
     deployment.yaml
     service.yaml
 ```
+
+`spec.installMode` tells certsuite which OLM OperatorGroup mode to configure
+for the run (`OwnNamespace`, `SingleNamespace`, `MultiNamespace`, or
+`AllNamespaces`). That is distinct from the CSV `installModes` list, which
+only declares what the operator *supports*.
+
+`spec.ocpVersion` (optional, EaaS only) is the OCP minor version to provision
+(e.g. `4.22`). When set, it overrides FBC-based version selection so the guest
+matches the operator’s expected Kubernetes level. If omitted, the pipeline
+keeps the FBC-derived version (with the usual EaaS supported-list fallback).
 
 The bundle is fetched by the `deploy-operands` task using the
 `TEST_BUNDLE_REF` pipeline parameter. By default, the pipeline runs
@@ -202,8 +236,9 @@ For each `(operator, release)` pair:
 3. Create an `IntegrationTestScenario` in your Konflux tenant config.
    See [examples/integration-test-scenario.yaml](../examples/integration-test-scenario.yaml).
 4. Ensure the required Secrets exist in your tenant namespace:
-   - `shared-cluster-kubeconfig` -- kubeconfig for the shared cluster
-   - `cert-track-api-token` -- API token for cert-track-results
-   - `quay-dockerconfig` -- OCI registry credentials
+   - EaaS: `quay-dockerconfig` (or similar) when using `OCI_REF` /
+     `CREDENTIALS_SECRET_NAME` for results push
+   - Shared cluster: also `shared-cluster-kubeconfig`, and optionally
+     `cert-track-api-token`
 5. Merge a change to your FBC component -- the pipeline triggers
    automatically on push events.

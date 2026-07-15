@@ -5,7 +5,19 @@ metadata:
   labels:
     app.kubernetes.io/part-of: ptp-operator
 spec:
+  # Operand / operator install namespace for this test run.
   namespace: openshift-ptp
+
+  # OLM OperatorGroup install mode to use for this test.
+  # CSV installModes list what is *supported*; this selects which mode
+  # certsuite configures (OwnNamespace | SingleNamespace | MultiNamespace | AllNamespaces).
+  installMode: OwnNamespace
+
+  # Optional: pin EaaS guest OCP minor (must be in EaaS supported list).
+  # Omit while EaaS tops out below the FBC target (e.g. FBC 4.22, EaaS ≤4.21);
+  # the pipeline then uses the FBC-picked/fallback guest. patches/csv.json
+  # drops minKubeVersion so install can proceed on that skew.
+  # ocpVersion: "4.22"
 
   description: |
     Software-only test deployment of ptp-operator operands. Creates a
@@ -15,12 +27,16 @@ spec:
     configuration, which is sufficient to verify the operator is
     properly deployed and functioning.
 
+    HyperShift/EaaS: patches/csv.json clears the master nodeSelector
+    (guests have no master nodes) and drops minKubeVersion so CSV install
+    can succeed when EaaS provisions below the FBC/CSV kube floor.
+
   readiness:
     timeout: 300
     checks:
       # Rollout readiness (waits for pods to be Running)
       - kind: Deployment
-        name: ptp-operator-controller-manager
+        name: ptp-operator
       - kind: DaemonSet
         name: linuxptp-daemon
       # Presence checks (verifies the resource exists)
