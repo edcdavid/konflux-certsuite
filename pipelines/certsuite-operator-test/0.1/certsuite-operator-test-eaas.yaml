@@ -151,9 +151,10 @@ spec:
           - name: registryPullSecret
             type: string
         results:
+          # get-bundle is inlined (not a StepAction ref) so DOCKER_CONFIG / volumeMounts
+          # are allowed — Tekton rejects env/volumeMounts together with step ref.
           - name: unreleasedBundle
             value: "$(steps.get-bundle.results.unreleasedBundle)"
-          # Written directly by resolve-quay-bundle (task-level result, not step result)
           - name: quayBundle
             description: Pullable quay.io bundle image (same digest as catalog ref)
           - name: packageName
@@ -198,36 +199,102 @@ spec:
                 echo "WARNING: no registry pull credentials found; registry.redhat.io pulls may fail"
               fi
 
+          # Inlined from tekton-integration-catalog get-unreleased-bundle StepAction so
+          # we can set DOCKER_CONFIG (forbidden on steps that use ref).
           - name: get-bundle
+            image: quay.io/konflux-ci/konflux-test:v1.4.48@sha256:9b815268fb2bf10b5d745518da1c6568944f15816efe51adc192972b42a6e74d
             computeResources:
               limits:
                 memory: 8Gi
               requests:
                 memory: 8Gi
                 cpu: "1"
+            results:
+              - name: unreleasedBundle
+                type: string
+              - name: packageName
+                type: string
+              - name: channelName
+                type: string
             env:
               - name: DOCKER_CONFIG
                 value: /workspace/docker-config
+              - name: FBC_FRAGMENT
+                value: "$(tasks.parse-metadata.results.component-container-image)"
+              - name: PACKAGE_NAME
+                value: $(params.PACKAGE_NAME)
+              - name: CHANNEL_NAME
+                value: $(params.CHANNEL_NAME)
             volumeMounts:
               - name: docker-config
                 mountPath: /workspace/docker-config
                 readOnly: true
-            ref:
-              resolver: git
-              params:
-                - name: url
-                  value: https://github.com/konflux-ci/tekton-integration-catalog.git
-                - name: revision
-                  value: main
-                - name: pathInRepo
-                  value: stepactions/bundles/get-unreleased-bundle/0.1/get-unreleased-bundle.yaml
-            params:
-              - name: fbcFragment
-                value: "$(tasks.parse-metadata.results.component-container-image)"
-              - name: packageName
-                value: $(params.PACKAGE_NAME)
-              - name: channelName
-                value: $(params.CHANNEL_NAME)
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+              . /utils.sh
+
+              if [[ -z "${FBC_FRAGMENT}" ]]; then
+                echo "Error: FBC_FRAGMENT parameter is required." >&2
+                exit 1
+              fi
+
+              echo "Retrieving unreleased bundles..."
+              if ! unreleased_bundles=$(get_unreleased_bundles -i "$FBC_FRAGMENT"); then
+                echo "Could not get unreleased bundle images from the fragment. Make sure you have ImagePullCredentials for registry.redhat.io (set REGISTRY_PULL_SECRET or link a pull secret to konflux-integration-runner)" >&2
+                exit 1
+              fi
+
+              if [[ -z "${unreleased_bundles}" ]]; then
+                echo "No unreleased bundles found. Exiting as a no-op."
+                echo -n "" > "$(results.unreleasedBundle.path)"
+                echo -n "" > "$(results.packageName.path)"
+                echo -n "" > "$(results.channelName.path)"
+                exit 0
+              fi
+              echo "Unreleased bundles found: $unreleased_bundles"
+
+              if ! RENDER_OUT_FBC=$(render_opm -t "$FBC_FRAGMENT"); then
+                echo "Failed to render the FBC fragment" >&2
+                exit 1
+              fi
+
+              if [[ -z "$PACKAGE_NAME" ]]; then
+                echo "Checking package association of unreleased bundles..."
+                package_image_map=$(group_bundle_images_by_package "$RENDER_OUT_FBC" "$unreleased_bundles")
+                echo "Package-image map: $package_image_map"
+                package_count=$(echo "$package_image_map" | jq 'keys | length')
+
+                if [[ "$package_count" -gt 1 ]]; then
+                  echo "Error: Multiple packages detected. User must specify PACKAGE_NAME." >&2
+                  exit 1
+                fi
+
+                PACKAGE_NAME=$(echo "$package_image_map" | jq -r 'keys[0]')
+              fi
+              echo "Using package: $PACKAGE_NAME"
+
+              if [[ -z "$CHANNEL_NAME" ]]; then
+                CHANNEL_NAME=$(get_channel_from_catalog "$RENDER_OUT_FBC" "$PACKAGE_NAME")
+                if [[ -z "$CHANNEL_NAME" ]]; then
+                  echo "Failed to determine a default channel for package '$PACKAGE_NAME'" >&2
+                  exit 1
+                fi
+              fi
+              echo "Using channel: $CHANNEL_NAME"
+
+              if ! highest_version_from_bundles_list=$(get_highest_version_from_bundles_list "$RENDER_OUT_FBC" "$PACKAGE_NAME" "$CHANNEL_NAME" "$unreleased_bundles"); then
+                echo "No unreleased bundle(s) found matching the specified package and/or channel. Exiting as a no-op."
+                echo -n "" > "$(results.unreleasedBundle.path)"
+                echo -n "" > "$(results.packageName.path)"
+                echo -n "" > "$(results.channelName.path)"
+                exit 0
+              fi
+
+              echo "Highest bundle: $highest_version_from_bundles_list"
+              echo -n -e "$highest_version_from_bundles_list" > "$(results.unreleasedBundle.path)"
+              echo -n "$PACKAGE_NAME" > "$(results.packageName.path)"
+              echo -n "$CHANNEL_NAME" > "$(results.channelName.path)"
 
           # Catalog refs point at registry.redhat.io (401 for unreleased images).
           # Resolve the same digest on quay.io before any step tries opm render.
