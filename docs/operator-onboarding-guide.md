@@ -53,12 +53,8 @@ metadata:
   labels:
     app.kubernetes.io/part-of: my-operator
 spec:
-  # OLM package / channel used for the Subscription.
-  # Prefer these over pre-onboarding --package-name / --channel-name.
-  packageName: my-operator
-  channelName: stable
-
   # Namespace for operator install AND operand deployment.
+  # Package/channel are auto-discovered from the FBC / PackageManifest.
   # Leave empty to fall back to CSV suggested-namespace, then auto-generate.
   namespace: ""
 
@@ -530,7 +526,7 @@ The lifecycle-agent test bundle at
 covers a Deployment-based operator:
 
 - Installs into `openshift-lifecycle-agent` (`OwnNamespace`)
-- Declares `packageName` / `channelName` for Subscription resolution
+- Package/channel come from the FBC / PackageManifest (not the TestBundle)
 - Applies an **ImageBasedUpgrade** CR left in `Idle` so the controller
   reconciles without seed generation or an image-based upgrade
 - Does **not** deploy `SeedGenerator` (that would attempt host seed work)

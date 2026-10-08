@@ -7,10 +7,6 @@ metadata:
   labels:
     app.kubernetes.io/part-of: lifecycle-agent
 spec:
-  packageName: lifecycle-agent
-  # FBC channels for this Konflux catalog: stable, 5.1 (default: stable).
-  channelName: stable
-
   # CSV suggested-namespace
   namespace: openshift-lifecycle-agent
 

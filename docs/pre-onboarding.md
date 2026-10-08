@@ -15,15 +15,11 @@ then repeats on a CRC (single-node) guest.
 - `docker` or `podman` (FBC `/configs` extraction; also certsuite)
 - `skopeo` (recommended for fast FBC image pull checks)
 
-OLM package/channel resolution order:
+OLM package/channel are auto-discovered (not set in the TestBundle):
 
-1. `--package-name` / `--channel-name` (optional CLI overrides)
-2. TestBundle `spec.packageName` / `spec.channelName` (preferred)
-3. `opm render` of the FBC (when available)
-4. Guest `PackageManifest` after the CatalogSource is READY
-
-You normally do **not** need the CLI flags when the TestBundle declares
-`packageName` / `channelName`.
+1. `opm render` of the FBC (when available)
+2. Guest `PackageManifest` after the CatalogSource is READY
+3. `--package-name` / `--channel-name` (optional CLI overrides only)
 
 ### Management cluster
 
@@ -141,7 +137,7 @@ HCP workers need enough memory (recommend ≥16Gi) for the FBC image (~800Mi).
 | `--test-bundle-path` | Local bundle dir (skips git download; useful while debugging) |
 | `--test-bundle-url` | `https://github.com/org/repo.git@branch#path/to/bundle` |
 | `--no-certsuite` | Install + deploy + readiness only |
-| `--package-name` / `--channel-name` | Optional overrides; prefer TestBundle `spec.packageName` / `spec.channelName` |
+| `--package-name` / `--channel-name` | Optional overrides; default is FBC / PackageManifest discovery |
 | `--cleanup false` | Keep leases / resources after the run (debug) |
 | `--lease-timeout` | Seconds to wait for lease `Bound` (default `1200`) |
 | `--skip-fbc-validate` | Skip stage pull checks for FBC-referenced images |
@@ -191,7 +187,7 @@ oc get clusterleases.guestcluster.opdev.io -n pre-onboarding
 ### Subscription has no CSV
 
 - Check CatalogSource connection state and PackageManifest
-- Set TestBundle `spec.packageName` / `spec.channelName` (or pass CLI overrides)
+- Confirm the FBC exposes a PackageManifest (or pass `--package-name` / `--channel-name`)
 - Inspect InstallPlan / bundle unpack pods for pull errors
 
 ### Cleanup

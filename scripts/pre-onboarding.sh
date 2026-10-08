@@ -47,10 +47,10 @@ Staging credentials (one required):
 Optional inputs:
   --source-namespace NAME     Namespace of the ClusterPools (default: current context ns)
   --stage-user USER           Stage registry username (default: 20430001|certsuite)
-  --package-name NAME         OLM package override (optional; prefer
-                              TestBundle spec.packageName, else FBC/catalog)
-  --channel-name NAME         OLM channel override (optional; prefer
-                              TestBundle spec.channelName, else FBC/catalog)
+  --package-name NAME         OLM package override (optional; default: FBC/opm
+                              or PackageManifest discovery)
+  --channel-name NAME         OLM channel override (optional; default: FBC/opm
+                              or PackageManifest discovery)
   --no-certsuite              Skip certsuite (install + deploy + readiness only)
   --certsuite-labels LIST     Comma-separated labels (default: common)
   --certsuite-image IMAGE     Default: quay.io/redhat-best-practices-for-k8s/certsuite:latest
@@ -900,16 +900,16 @@ validate_fbc_images() {
 # Prefer local opm render; fall back to PackageManifest discovery (test-art style)
 # when opm cannot pull multi-arch FBC images on the host.
 try_opm_render_metadata() {
-  # Precedence applied at the end: CLI > TestBundle > FBC render.
+  # Precedence: CLI override > FBC opm render > PackageManifest discovery.
   BUNDLE_CSV_NAME=""
   CSV_SUGGESTED_NS=""
   CSV_INSTALL_MODES=""
 
   local render_out
   if ! render_out="$(opm render "${FBC_URL}" 2>/dev/null)"; then
-    warn "opm render failed for '${FBC_URL}' (will use TestBundle / PackageManifest)"
-    PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME:-}}"
-    CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${BUNDLE_CHANNEL_NAME:-}}"
+    warn "opm render failed for '${FBC_URL}' (will use PackageManifest discovery)"
+    PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-}"
+    CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-}"
     return 1
   fi
 
@@ -938,8 +938,8 @@ try_opm_render_metadata() {
     | jq -r 'select(.kind == "ClusterServiceVersion")
       | .spec.installModes[]? | select(.supported == true) | .type' 2>/dev/null || true)"
 
-  PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME:-${pkg}}}"
-  CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${BUNDLE_CHANNEL_NAME:-${channel}}}"
+  PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${pkg}}"
+  CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${channel}}"
   BUNDLE_CSV_NAME="${csv_name}"
   CSV_SUGGESTED_NS="${suggested_ns}"
   CSV_INSTALL_MODES="${install_modes}"
@@ -972,8 +972,8 @@ discover_package_from_catalog() {
       channel="$(echo "${pm_json}" | jq -r '.status.defaultChannel // .status.channels[0].name // empty' 2>/dev/null || true)"
       suggested_ns="$(echo "${pm_json}" | jq -r '
         .status.channels[0].currentCSVDesc.annotations["operatorframework.io/suggested-namespace"] // empty' 2>/dev/null || true)"
-      PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME:-${pkg}}}"
-      CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${BUNDLE_CHANNEL_NAME:-${channel:-stable}}}"
+      PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${pkg}}"
+      CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${channel:-stable}}"
       CSV_SUGGESTED_NS="${CSV_SUGGESTED_NS:-${suggested_ns}}"
       export PACKAGE_NAME CHANNEL_NAME CSV_SUGGESTED_NS
       info "Discovered package=${PACKAGE_NAME} channel=${CHANNEL_NAME} suggestedNs=${CSV_SUGGESTED_NS:-<none>}"
@@ -981,14 +981,14 @@ discover_package_from_catalog() {
     fi
     sleep 5
   done
-  if [[ -n "${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME:-}}" ]]; then
-    PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME}}"
-    CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${BUNDLE_CHANNEL_NAME:-stable}}"
+  if [[ -n "${PACKAGE_NAME_OVERRIDE:-}" ]]; then
+    PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE}"
+    CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-stable}"
     export PACKAGE_NAME CHANNEL_NAME
-    warn "PackageManifest not found; using TestBundle/CLI package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
+    warn "PackageManifest not found; using CLI package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
     return 0
   fi
-  fail "no PackageManifest for catalog=${catsrc_name}; set TestBundle spec.packageName or pass --package-name"
+  fail "no PackageManifest for catalog=${catsrc_name}; pass --package-name or fix the FBC catalog"
   exit 1
 }
 
@@ -997,14 +997,14 @@ install_operator() {
   info "Installing operator from FBC '${FBC_URL}' on ${topology} cluster ..."
 
   export BUNDLE_DIR
-  # Resolve namespace / installMode / package / channel from the test bundle first.
+  # Resolve namespace / installMode from the test bundle; package/channel from FBC/catalog.
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/resolve-bundle-config.sh"
 
   try_opm_render_metadata || true
-  # Precedence: CLI override > TestBundle > FBC/opm (already applied in try_opm) > later catalog discovery
-  PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${BUNDLE_PACKAGE_NAME:-${PACKAGE_NAME:-}}}"
-  CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${BUNDLE_CHANNEL_NAME:-${CHANNEL_NAME:-}}}"
+  # Precedence: CLI override > FBC/opm (try_opm) > PackageManifest discovery
+  PACKAGE_NAME="${PACKAGE_NAME_OVERRIDE:-${PACKAGE_NAME:-}}"
+  CHANNEL_NAME="${CHANNEL_NAME_OVERRIDE:-${CHANNEL_NAME:-}}"
   [[ -n "${CHANNEL_NAME:-}" && "${CHANNEL_NAME}" != "null" ]] || CHANNEL_NAME=""
   export PACKAGE_NAME CHANNEL_NAME BUNDLE_CSV_NAME CSV_SUGGESTED_NS CSV_INSTALL_MODES
 
@@ -1096,7 +1096,7 @@ EOF
     info "Using package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
   fi
   if [[ -z "${PACKAGE_NAME:-}" || "${PACKAGE_NAME}" == "null" ]]; then
-    fail "OLM package name unresolved; set TestBundle spec.packageName/channelName or pass --package-name/--channel-name"
+    fail "OLM package name unresolved; pass --package-name/--channel-name or ensure FBC/catalog exposes a PackageManifest"
     exit 1
   fi
   CHANNEL_NAME="${CHANNEL_NAME:-stable}"

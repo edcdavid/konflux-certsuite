@@ -5,9 +5,6 @@ metadata:
   labels:
     app.kubernetes.io/part-of: ptp-operator
 spec:
-  packageName: ptp-operator
-  channelName: stable
-
   namespace: openshift-ptp
 
   # PTP supports OwnNamespace and SingleNamespace; use OwnNamespace for test.

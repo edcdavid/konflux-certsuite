@@ -10,8 +10,8 @@
 #
 # Exports:
 #   BUNDLE_NAMESPACE, BUNDLE_INSTALL_MODE, OG_TARGET_NS,
-#   BUNDLE_PACKAGE_NAME, BUNDLE_CHANNEL_NAME,
 #   DISCOVERY_OPERATOR_LABEL, DISCOVERY_POD_LABEL, DISCOVERY_RESOURCE_KINDS
+# Package/channel are resolved later from FBC opm render or PackageManifest.
 
 set -euo pipefail
 
@@ -20,35 +20,8 @@ BUNDLE_FILE="${BUNDLE_DIR}/certsuite-test-bundle.yaml"
 
 _yq() { yq e "$1" "${BUNDLE_FILE}" 2>/dev/null || echo ""; }
 
-# ── OLM package / channel (optional; prefer over CLI when set) ────────
-# Accept packageName/channelName or shorter package/channel aliases.
-BUNDLE_PACKAGE_NAME=$(_yq '.spec.packageName // .spec.package // ""')
-BUNDLE_CHANNEL_NAME=$(_yq '.spec.channelName // .spec.channel // ""')
-if [[ -z "${BUNDLE_PACKAGE_NAME}" || "${BUNDLE_PACKAGE_NAME}" == "null" ]]; then
-  BUNDLE_PACKAGE_NAME=$(awk '
-    /^spec:/ { in_spec=1; next }
-    in_spec && /^[^ ]/ { in_spec=0 }
-    in_spec && /^[[:space:]]+(packageName|package):[[:space:]]*/ {
-      sub(/^[[:space:]]+(packageName|package):[[:space:]]*/, "", $0)
-      gsub(/["'\'']/, "", $0)
-      print; exit
-    }
-  ' "${BUNDLE_FILE}" 2>/dev/null || true)
-fi
-if [[ -z "${BUNDLE_CHANNEL_NAME}" || "${BUNDLE_CHANNEL_NAME}" == "null" ]]; then
-  BUNDLE_CHANNEL_NAME=$(awk '
-    /^spec:/ { in_spec=1; next }
-    in_spec && /^[^ ]/ { in_spec=0 }
-    in_spec && /^[[:space:]]+(channelName|channel):[[:space:]]*/ {
-      sub(/^[[:space:]]+(channelName|channel):[[:space:]]*/, "", $0)
-      gsub(/["'\'']/, "", $0)
-      print; exit
-    }
-  ' "${BUNDLE_FILE}" 2>/dev/null || true)
-fi
-[[ "${BUNDLE_PACKAGE_NAME}" == "null" ]] && BUNDLE_PACKAGE_NAME=""
-[[ "${BUNDLE_CHANNEL_NAME}" == "null" ]] && BUNDLE_CHANNEL_NAME=""
-export BUNDLE_PACKAGE_NAME BUNDLE_CHANNEL_NAME
+# Clear any stale env so install always discovers from the catalog.
+unset BUNDLE_PACKAGE_NAME BUNDLE_CHANNEL_NAME || true
 
 # ── Namespace ────────────────────────────────────────────────────────
 BUNDLE_NAMESPACE=$(_yq '.spec.namespace // ""')
@@ -111,8 +84,7 @@ export DISCOVERY_OPERATOR_LABEL DISCOVERY_POD_LABEL DISCOVERY_RESOURCE_KINDS
 
 echo "[$(date -u +%FT%T.%3NZ)] Bundle config resolved:"
 echo "  namespace:      ${BUNDLE_NAMESPACE:-<auto>}"
-echo "  package:        ${BUNDLE_PACKAGE_NAME:-<from FBC/catalog>}"
-echo "  channel:        ${BUNDLE_CHANNEL_NAME:-<from FBC/catalog>}"
+echo "  package/channel: <from FBC/catalog>"
 echo "  installMode:    ${BUNDLE_INSTALL_MODE}"
 echo "  OG targets:     ${OG_TARGET_NS:-<cluster-wide>}"
 echo "  operator label: ${DISCOVERY_OPERATOR_LABEL}"
