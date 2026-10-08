@@ -14,6 +14,11 @@ metadata:
   labels:
     app.kubernetes.io/part-of: example-operator
 spec:
+  # OLM package / channel for Subscription (preferred over CLI overrides).
+  # Leave empty to discover from the FBC / PackageManifest.
+  packageName: example-operator
+  channelName: stable
+
   # Namespace for operator install AND operand deployment.
   # Leave empty to fall back to CSV suggested-namespace, then auto-generate.
   namespace: ""

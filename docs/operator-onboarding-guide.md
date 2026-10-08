@@ -53,6 +53,11 @@ metadata:
   labels:
     app.kubernetes.io/part-of: my-operator
 spec:
+  # OLM package / channel used for the Subscription.
+  # Prefer these over pre-onboarding --package-name / --channel-name.
+  packageName: my-operator
+  channelName: stable
+
   # Namespace for operator install AND operand deployment.
   # Leave empty to fall back to CSV suggested-namespace, then auto-generate.
   namespace: ""

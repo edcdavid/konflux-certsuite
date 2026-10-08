@@ -1,6 +1,6 @@
 [
   {
     "op": "remove",
-    "path": "/spec/install/spec/deployments/0/spec/template/spec/nodeSelector/node-role.kubernetes.io~1master"
+    "path": "/spec/install/spec/deployments/0/spec/template/spec/nodeSelector"
   }
 ]

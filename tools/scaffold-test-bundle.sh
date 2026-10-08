@@ -19,6 +19,9 @@ runtime configuration (certsuite_config.yml).
 
 Options:
   --name NAME          Bundle name (required)
+  --package NAME       OLM package name (written to spec.packageName)
+  --channel NAME       OLM channel (written to spec.channelName; default: stable
+                       when --package is set)
   --namespace NS       Target namespace for install + operands (default: auto)
   --install-mode MODE  OLM install mode: AllNamespaces, OwnNamespace,
                        SingleNamespace, MultiNamespace (default: empty = auto)
@@ -30,6 +33,8 @@ EOF
 }
 
 NAME=""
+PACKAGE_NAME=""
+CHANNEL_NAME=""
 NAMESPACE=""
 INSTALL_MODE=""
 WORKLOAD_KIND="DaemonSet"
@@ -38,6 +43,8 @@ OUTPUT="./certsuite-test-bundle"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)          NAME="$2"; shift 2 ;;
+    --package)       PACKAGE_NAME="$2"; shift 2 ;;
+    --channel)       CHANNEL_NAME="$2"; shift 2 ;;
     --namespace)     NAMESPACE="$2"; shift 2 ;;
     --install-mode)  INSTALL_MODE="$2"; shift 2 ;;
     --workload-kind) WORKLOAD_KIND="$2"; shift 2 ;;
@@ -46,6 +53,10 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
+
+if [[ -n "${PACKAGE_NAME}" && -z "${CHANNEL_NAME}" ]]; then
+  CHANNEL_NAME="stable"
+fi
 
 if [[ -z "${NAME}" ]]; then
   echo "ERROR: --name is required"
@@ -67,6 +78,11 @@ metadata:
   labels:
     app.kubernetes.io/part-of: ${NAME}
 spec:
+  # OLM package / channel for Subscription. Prefer these over CLI
+  # --package-name / --channel-name. Leave empty to discover from FBC/catalog.
+  packageName: "${PACKAGE_NAME}"
+  channelName: "${CHANNEL_NAME}"
+
   # Namespace for operator install AND operand deployment.
   # Leave empty to fall back to CSV suggested-namespace, then auto-generate.
   namespace: "${NAMESPACE}"

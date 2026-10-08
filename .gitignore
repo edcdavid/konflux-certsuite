@@ -12,3 +12,10 @@ Thumbs.db
 # Temporary
 tmp/
 *.tmp
+
+# Local pre-onboarding / credentials (never commit)
+.mgmt.kubeconfig
+*.kubeconfig
+config.test
+pre-onboarding-e2e.log
+pre-onboarding-results-*/
