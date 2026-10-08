@@ -1,0 +1,13 @@
+# Minimal ImageBasedUpgrade left in Idle — exercises CRD + controller
+# reconcile without advancing to Prep/Upgrade (no seed image pull / pivot).
+# Do not deploy SeedGenerator here; that would attempt host seed generation.
+apiVersion: lca.openshift.io/v1
+kind: ImageBasedUpgrade
+metadata:
+  name: upgrade
+spec:
+  stage: Idle
+  seedImageRef:
+    image: quay.io/example/unused-idle-placeholder:latest
+    version: "0.0.0"
+  autoRollbackOnFailure: {}

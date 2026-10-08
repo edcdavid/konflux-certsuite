@@ -523,6 +523,18 @@ demonstrates a real-world bundle:
 - The operator reconciles these CRs and creates the linuxptp-daemon
   DaemonSet, which is enough to verify proper deployment
 
+## Example: lifecycle-agent
+
+The lifecycle-agent test bundle at
+[examples/lifecycle-agent-test-bundle/](../examples/lifecycle-agent-test-bundle/)
+covers a Deployment-based operator:
+
+- Installs into `openshift-lifecycle-agent` (`OwnNamespace`)
+- Declares `packageName` / `channelName` for Subscription resolution
+- Applies an **ImageBasedUpgrade** CR left in `Idle` so the controller
+  reconciles without seed generation or an image-based upgrade
+- Does **not** deploy `SeedGenerator` (that would attempt host seed work)
+
 ## Troubleshooting
 
 | Issue | Cause | Fix |

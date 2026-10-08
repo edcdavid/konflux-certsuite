@@ -1,0 +1,14 @@
+# Certsuite runtime configuration for lifecycle-agent.
+# https://redhat-best-practices-for-k8s.github.io/certsuite/configuration/
+targetNameSpaces:
+  - name: openshift-lifecycle-agent
+
+podsUnderTestLabels:
+  - "redhat-best-practices-for-k8s.com/generic: target"
+
+operatorsUnderTestLabels:
+  - "redhat-best-practices-for-k8s.com/operator: target"
+
+targetCrdFilters:
+  - nameSuffix: "lca.openshift.io"
+    scalable: false

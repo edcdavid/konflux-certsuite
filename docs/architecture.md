@@ -182,8 +182,9 @@ By default, the pipeline runs **all** certsuite tests. Pass
 
 See the [Operator Onboarding Guide](operator-onboarding-guide.md) for
 how to create a bundle, and the
-[ptp-operator example](../examples/ptp-operator-test-bundle/) for a
-real-world reference.
+[ptp-operator](../examples/ptp-operator-test-bundle/) or
+[lifecycle-agent](../examples/lifecycle-agent-test-bundle/) examples for
+real-world references.
 
 ## Results Flow
 

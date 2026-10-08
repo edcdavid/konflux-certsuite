@@ -129,6 +129,9 @@ HCP workers need enough memory (recommend ≥16Gi) for the FBC image (~800Mi).
   --staging-token "$(cat /path/to/stage-jwt.txt)" \
   --test-bundle-path examples/ptp-operator-test-bundle \
   --no-certsuite
+
+# Lifecycle Agent example (Idle ImageBasedUpgrade, no seed generation):
+#   --test-bundle-path examples/lifecycle-agent-test-bundle
 ```
 
 ### Common flags
