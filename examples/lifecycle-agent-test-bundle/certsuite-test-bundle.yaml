@@ -8,8 +8,8 @@ metadata:
     app.kubernetes.io/part-of: lifecycle-agent
 spec:
   packageName: lifecycle-agent
-  # Upstream OLM bundle channel (operators.operatorframework.io.bundle.channels.v1).
-  channelName: alpha
+  # FBC channels for this Konflux catalog: stable, 5.1 (default: stable).
+  channelName: stable
 
   # CSV suggested-namespace
   namespace: openshift-lifecycle-agent
